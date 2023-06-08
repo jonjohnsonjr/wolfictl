@@ -6,6 +6,8 @@ replace gitlab.alpinelinux.org/alpine/go => gitlab.alpinelinux.org/jdolitsky/go 
 
 replace k8s.io/client-go => k8s.io/client-go v0.25.3
 
+replace github.com/dominikbraun/graph => github.com/jonjohnsonjr/graph v0.0.0-20230608160704-5cdb23aea08a
+
 require (
 	chainguard.dev/apko v0.7.4-0.20230427160853-4082ea6e082e
 	chainguard.dev/melange v0.3.1-0.20230502151024-40098bfea030
@@ -17,7 +19,7 @@ require (
 	github.com/charmbracelet/bubbletea v0.23.2
 	github.com/charmbracelet/lipgloss v0.7.1
 	github.com/cpuguy83/go-md2man v1.0.10
-	github.com/dominikbraun/graph v0.22.2-0.20230606093412-daffba1d8554
+	github.com/dominikbraun/graph v0.22.2
 	github.com/dprotaso/go-yit v0.0.0-20220510233725-9ba8df137936
 	github.com/facebookincubator/nvdtools v0.1.5
 	github.com/fatih/color v1.15.0
