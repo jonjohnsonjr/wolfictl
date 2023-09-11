@@ -120,6 +120,9 @@ func text(g dag.Graph, pkgs *dag.Packages, arch string, t textType, w io.Writer)
 		return err
 	}
 
+	log.Printf("len(pkgs) = %d", len(pkgs.Packages()))
+	log.Printf("len(all) = %d", len(all))
+
 	for _, node := range all {
 		name := node.Name()
 
