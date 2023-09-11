@@ -110,10 +110,10 @@ func text(g dag.Graph, pkgs *dag.Packages, arch string, t textType, w io.Writer)
 	}
 
 	// Filter out non-main packages -- we only care about config file names, not each subpackage.
-	filtered, err = filtered.Filter(dag.OnlyMainPackages(pkgs))
-	if err != nil {
-		return err
-	}
+	// filtered, err = filtered.Filter(dag.OnlyMainPackages(pkgs))
+	// if err != nil {
+	// 	return err
+	// }
 
 	all, err := filtered.ReverseSorted()
 	if err != nil {
@@ -122,7 +122,17 @@ func text(g dag.Graph, pkgs *dag.Packages, arch string, t textType, w io.Writer)
 
 	for _, node := range all {
 		name := node.Name()
-		pkg, _ := pkgs.PkgInfo(name) //nolint:errcheck
+
+		pkg, err := pkgs.PkgInfo(name)
+		if err != nil {
+			return err
+		}
+
+		// This is expected for subpackages, just skip them.
+		if pkg == nil {
+			continue
+		}
+
 		switch t {
 		case typeTarget:
 			fmt.Fprintf(w, "%s\n", makeTarget(name, arch, pkg))
