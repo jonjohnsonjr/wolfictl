@@ -27,12 +27,18 @@ import (
 	"github.com/wolfi-dev/wolfictl/pkg/scan"
 	"github.com/wolfi-dev/wolfictl/pkg/versions"
 	"golang.org/x/exp/slices"
+
+	_ "embed"
 )
 
 const (
 	outputFormatOutline = "outline"
 	outputFormatJSON    = "json"
+	outputFormatJason   = "jason"
 )
+
+//go:embed version.ansi
+var versionString []byte
 
 var validOutputFormats = []string{outputFormatOutline, outputFormatJSON}
 
@@ -148,7 +154,7 @@ wolfictl scan package1 package2 --remote
 
 			// Validate inputs
 
-			if !slices.Contains(validOutputFormats, p.outputFormat) {
+			if p.outputFormat != outputFormatJason && !slices.Contains(validOutputFormats, p.outputFormat) {
 				return fmt.Errorf(
 					"invalid output format %q, must be one of [%s]",
 					p.outputFormat,
@@ -226,6 +232,10 @@ wolfictl scan package1 package2 --remote
 				if err != nil {
 					return fmt.Errorf("failed to marshal scans to JSON: %w", err)
 				}
+			}
+
+			if p.outputFormat == outputFormatJason {
+				fmt.Printf("%s", versionString)
 			}
 
 			if len(inputPathsFailingRequireZero) > 0 {
