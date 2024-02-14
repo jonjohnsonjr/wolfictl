@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -17,6 +18,9 @@ import (
 	"chainguard.dev/melange/pkg/container/docker"
 	"github.com/chainguard-dev/clog"
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+	"go.opentelemetry.io/otel/sdk/trace"
 
 	"github.com/wolfi-dev/wolfictl/pkg/dag"
 )
@@ -27,6 +31,7 @@ func cmdBuild() *cobra.Command {
 	var jobs int
 	var dryrun bool
 	var extraKeys, extraRepos []string
+	var traceFile string
 
 	// TODO: allow building only named packages, taking deps into account.
 	// TODO: buildworld bool (build deps vs get them from package repo)
@@ -34,10 +39,29 @@ func cmdBuild() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:           "build",
 		SilenceErrors: true,
-		Args:          cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			log := clog.FromContext(ctx)
+
+			if traceFile != "" {
+				w, err := os.Create(traceFile)
+				if err != nil {
+					return fmt.Errorf("creating trace file: %w", err)
+				}
+				defer w.Close()
+				exporter, err := stdouttrace.New(stdouttrace.WithWriter(w))
+				if err != nil {
+					return fmt.Errorf("creating stdout exporter: %w", err)
+				}
+				tp := trace.NewTracerProvider(trace.WithBatcher(exporter))
+				otel.SetTracerProvider(tp)
+
+				defer tp.Shutdown(context.WithoutCancel(ctx))
+
+				tctx, span := otel.Tracer("wolfictl").Start(ctx, "build")
+				defer span.End()
+				ctx = tctx
+			}
 
 			if jobs == 0 {
 				jobs = runtime.GOMAXPROCS(0)
@@ -119,7 +143,7 @@ func cmdBuild() *cobra.Command {
 				return fmt.Errorf("no packages to build")
 			}
 
-			sorted, err := g.ReverseSorted()
+			sorted, err := g.Sorted()
 			if err != nil {
 				return err
 			}
@@ -128,23 +152,33 @@ func cmdBuild() *cobra.Command {
 				return fmt.Errorf("tasks(%d) != sorted(%d)", got, want)
 			}
 
-			for _, todo := range sorted {
-				t := tasks[todo.Name()]
-				go t.start(ctx)
+			todos := args
+			if len(todos) == 0 {
+				for _, todo := range sorted {
+					todos = append(todos, todo.Name())
+				}
+			}
+
+			for _, todo := range todos {
+				t := tasks[todo]
+				t.maybeStart(ctx)
 			}
 
 			count := len(tasks)
 
-			for _, todo := range sorted {
-				t := tasks[todo.Name()]
+			errs := []error{}
+			for _, todo := range todos {
+				t := tasks[todo]
 				log.Infof("%s status: %q", t.pkg, t.status)
 				if err := t.wait(); err != nil {
-					return fmt.Errorf("failed to build %s: %w", t.pkg, err)
+					errs = append(errs, fmt.Errorf("failed to build %s: %w", t.pkg, err))
+					log.Infof("Failed to build %s (%d failures)", t.pkg, len(errs))
+					continue
 				}
 				delete(tasks, t.pkg)
 				log.Infof("Finished building %s (%d/%d)", t.pkg, count-len(tasks), count)
 			}
-			return nil
+			return errors.Join(errs...)
 		},
 	}
 
@@ -156,6 +190,7 @@ func cmdBuild() *cobra.Command {
 	cmd.Flags().BoolVar(&dryrun, "dry-run", false, "print commands instead of executing them")
 	cmd.Flags().StringSliceVarP(&extraKeys, "keyring-append", "k", []string{"https://packages.wolfi.dev/os/wolfi-signing.rsa.pub"}, "path to extra keys to include in the build environment keyring")
 	cmd.Flags().StringSliceVarP(&extraRepos, "repository-append", "r", []string{"https://packages.wolfi.dev/os"}, "path to extra repositories to include in the build environment")
+	cmd.Flags().StringVar(&traceFile, "trace", "", "where to write trace output")
 	return cmd
 }
 
@@ -170,7 +205,9 @@ type task struct {
 	jobch  chan struct{}
 	status string
 
-	done bool
+	started bool
+	done    bool
+
 	cond *sync.Cond
 }
 
@@ -183,6 +220,10 @@ func (t *task) start(ctx context.Context) {
 		t.cond.Broadcast()
 		t.cond.L.Unlock()
 	}()
+
+	for _, dep := range t.deps {
+		dep.maybeStart(ctx)
+	}
 
 	for depname, dep := range t.deps {
 		t.status = "waiting on " + depname
@@ -207,8 +248,13 @@ func (t *task) start(ctx context.Context) {
 
 func (t *task) do(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
+		_, span := otel.Tracer("wolfictl").Start(ctx, "build "+t.pkg+" (canceled)")
+		defer span.End()
 		return err
 	}
+
+	ctx, span := otel.Tracer("wolfictl").Start(ctx, "build "+t.pkg)
+	defer span.End()
 
 	cfg, err := config.ParseConfiguration(ctx, fmt.Sprintf("%s.yaml", t.pkg), config.WithFS(os.DirFS(t.dir)))
 	if err != nil {
@@ -219,7 +265,7 @@ func (t *task) do(ctx context.Context) error {
 		arch := types.ParseArchitecture(arch).ToAPK()
 
 		// TODO: Handle these logs in an interesting way instead of discarding them.
-		log := clog.New(discard).With("arch", arch)
+		log := clog.New(clog.FromContext(ctx).Handler()).With("arch", arch)
 
 		ctx := clog.WithLogger(ctx, log)
 
@@ -263,8 +309,8 @@ func (t *task) do(ctx context.Context) error {
 			build.WithEnvFile(filepath.Join(t.dir, fmt.Sprintf("build-%s.env", arch))),
 			build.WithNamespace("wolfi"), // TODO: flag
 			build.WithSourceDir(sdir),
-			build.WithCacheSource("gs://wolfi-sources/"), // TODO: flag
-			build.WithCacheDir("./melange-cache/"),       // TODO: flag
+			// build.WithCacheSource("gs://wolfi-sources/"), // TODO: flag
+			// build.WithCacheDir("./melange-cache/"),       // TODO: flag
 			build.WithOutDir(filepath.Join(t.dir, "packages")),
 			build.WithRemove(true),
 		)
@@ -282,6 +328,17 @@ func (t *task) do(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (t *task) maybeStart(ctx context.Context) {
+	t.cond.L.Lock()
+	defer t.cond.L.Unlock()
+
+	if !t.started {
+		clog.FromContext(ctx).Infof("starting %s", t.pkg)
+		t.started = true
+		go t.start(ctx)
+	}
 }
 
 func (t *task) wait() error {
