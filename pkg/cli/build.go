@@ -232,11 +232,11 @@ func cmdBuild() *cobra.Command {
 					if err := t.wait(); err != nil {
 						errs = append(errs, fmt.Errorf("failed to build %s: %w", t.pkg, err))
 						log.Infof("Failed to build %s (%d failures)", t.pkg, len(errs))
-						continue
 					}
 					delete(tasks, t.pkg)
 					log.Infof("Finished building %s (%d/%d)", t.pkg, count-len(tasks), count)
 				}
+				log.Infof("Finished building %d packages, %d failed", count, len(errs))
 				return errors.Join(errs...)
 			})
 
@@ -295,9 +295,6 @@ func (t *task) start(ctx context.Context) {
 		dep.maybeStart(ctx)
 	}
 
-	log := clog.New(clog.FromContext(ctx).Handler()).With("package", t.pkg)
-	ctx = clog.WithLogger(ctx, log)
-
 	for depname, dep := range t.deps {
 		t.status = "waiting on " + depname
 		if err := dep.wait(); err != nil {
@@ -324,6 +321,9 @@ func (t *task) logfile() string {
 }
 
 func (t *task) do(ctx context.Context) error {
+	log := clog.New(clog.FromContext(ctx).Handler()).With("package", t.pkg)
+	ctx = clog.WithLogger(ctx, log)
+
 	if err := ctx.Err(); err != nil {
 		_, span := otel.Tracer("wolfictl").Start(ctx, "build "+t.pkg+" (canceled)")
 		defer span.End()
@@ -349,8 +349,11 @@ func (t *task) do(ctx context.Context) error {
 	for _, arch := range t.archs {
 		arch := types.ParseArchitecture(arch).ToAPK()
 
-		log := clog.New(clog.FromContext(ctx).Handler()).With("arch", arch)
-		ctx := clog.WithLogger(ctx, log)
+		ctx := ctx
+		if len(t.archs) > 1 {
+			log := clog.New(log.Handler()).With("arch", arch)
+			ctx = clog.WithLogger(ctx, log)
+		}
 
 		// See if we already have the package built.
 		apk := fmt.Sprintf("%s-%s-r%d.apk", cfg.Package.Name, cfg.Package.Version, cfg.Package.Epoch)
@@ -457,45 +460,70 @@ func (h *handler) dashFragment(w http.ResponseWriter, r *http.Request) {
 		return strings.Compare(a.pkg, b.pkg)
 	})
 	fmt.Fprintln(w, "<h1>wolfictl build</h1>")
-	fmt.Fprintln(w, "<h2>running</h2>")
-	fmt.Fprintln(w, "<ul>")
-	for _, t := range vals {
-		if t.status == "running" {
-			fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a></li>\n", t.pkg, t.pkg)
-		}
-	}
-	fmt.Fprintln(w, "</ul>")
 
-	fmt.Fprintln(w, "<h2>done</h2>")
-	fmt.Fprintln(w, "<ul>")
+	running := []*task{}
+	failed := []*task{}
+	done := []*task{}
+	queued := []*task{}
+	blocked := []*task{}
 	for _, t := range vals {
 		if t.done {
 			if t.err != nil {
-				fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a>: %v</li>", t.pkg, t.pkg, t.err)
+				failed = append(failed, t)
 			} else {
-				fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a>: %s</li>", t.pkg, t.pkg, t.status)
+				done = append(done, t)
 			}
+		} else if t.status == "running" {
+			running = append(running, t)
+		} else if t.status == "waiting for semaphore" {
+			queued = append(queued, t)
+		} else if strings.HasPrefix(t.status, "waiting on") {
+			blocked = append(blocked, t)
 		}
+	}
+
+	fmt.Fprintln(w, "<h2>running</h2>")
+	fmt.Fprintln(w, "<ul>")
+	for _, t := range running {
+		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a></li>\n", t.pkg, t.pkg)
 	}
 	fmt.Fprintln(w, "</ul>")
 
-	fmt.Fprintln(w, "<h2>queued</h2>")
+	fmt.Fprintln(w, "<details>")
+	fmt.Fprintf(w, "<summary>failed (%d)</summary>\n", len(failed))
 	fmt.Fprintln(w, "<ul>")
-	for _, t := range vals {
-		if t.status == "waiting for semaphore" {
-			fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a></li>", t.pkg, t.pkg)
-		}
+	for _, t := range failed {
+		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a>: %v</li>", t.pkg, t.pkg, t.err)
 	}
 	fmt.Fprintln(w, "</ul>")
+	fmt.Fprintln(w, "</details>")
 
-	fmt.Fprintln(w, "<h2>blocked</h2>")
+	fmt.Fprintln(w, "<details>")
+	fmt.Fprintf(w, "<summary>done (%d)</summary>\n", len(done))
 	fmt.Fprintln(w, "<ul>")
-	for _, t := range vals {
-		if strings.HasPrefix(t.status, "waiting on") {
-			fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a>: %s</li>", t.pkg, t.pkg, t.status)
-		}
+	for _, t := range done {
+		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a>: %s</li>", t.pkg, t.pkg, t.status)
 	}
 	fmt.Fprintln(w, "</ul>")
+	fmt.Fprintln(w, "</details>")
+
+	fmt.Fprintln(w, "<details>")
+	fmt.Fprintf(w, "<summary>queued (%d)</summary>\n", len(queued))
+	fmt.Fprintln(w, "<ul>")
+	for _, t := range queued {
+		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a></li>", t.pkg, t.pkg)
+	}
+	fmt.Fprintln(w, "</ul>")
+	fmt.Fprintln(w, "</details>")
+
+	fmt.Fprintln(w, "<details>")
+	fmt.Fprintf(w, "<summary>blocked (%d)</summary>\n", len(blocked))
+	fmt.Fprintln(w, "<ul>")
+	for _, t := range blocked {
+		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a>: %s</li>", t.pkg, t.pkg, t.status)
+	}
+	fmt.Fprintln(w, "</ul>")
+	fmt.Fprintln(w, "</details>")
 }
 
 func (h *handler) pkgFragment(w http.ResponseWriter, r *http.Request, pkg string) {
