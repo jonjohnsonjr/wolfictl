@@ -311,8 +311,8 @@ github.com/cespare/xxhash/v2 v2.2.0 h1:DC2CZ1Ep5Y4k3ZQ899DldepgrayRUGE6BBZ/cd9Cj
 github.com/cespare/xxhash/v2 v2.2.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/chainguard-dev/clog v1.3.1 h1:CDNCty5WKQhJzoOPubk0GdXt+bPQyargmfClqebrpaQ=
 github.com/chainguard-dev/clog v1.3.1/go.mod h1:cV516KZWqYc/phZsCNwF36u/KMGS+Gj5Uqeb8Hlp95Y=
-github.com/chainguard-dev/go-apk v0.0.0-20240207141231-4a3a18e598d6 h1:EV1GSw01XEbGAUElsHbVzG2N1+pGuewP2wmzcy+9MbM=
-github.com/chainguard-dev/go-apk v0.0.0-20240207141231-4a3a18e598d6/go.mod h1:OdsmvVJb8RNVcTVQ7x07L319LLeiRaRnnsmj8qBBgb4=
+github.com/chainguard-dev/go-apk v0.0.0-20240214182314-0557134e5e22 h1:QvVDC+ffM7xbb4+gzpTJU86dn6CyoqKbahQVECVDd84=
+github.com/chainguard-dev/go-apk v0.0.0-20240214182314-0557134e5e22/go.mod h1:OdsmvVJb8RNVcTVQ7x07L319LLeiRaRnnsmj8qBBgb4=
 github.com/chainguard-dev/go-pkgconfig v0.0.0-20230905070237-e8c268e1732e h1:MiWG71ge3/KiR2fW9R8MFHck4NbCtuwD6NpOXcZQ1qo=
 github.com/chainguard-dev/go-pkgconfig v0.0.0-20230905070237-e8c268e1732e/go.mod h1:obzGv2cx3tkRgkLQADSPaRl3OEsYmyfSv7t2Wu60tZw=
 github.com/chainguard-dev/yam v0.0.1 h1:c1hPfBc8aI/lm/iTc3/DNaTEE/HIOEovDObc7X1hNxs=

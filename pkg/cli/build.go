@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -166,7 +167,7 @@ func cmdBuild() *cobra.Command {
 				return fmt.Errorf("no packages to build")
 			}
 
-			sorted, err := g.Sorted()
+			sorted, err := g.ReverseSorted()
 			if err != nil {
 				return err
 			}
@@ -445,22 +446,106 @@ func newRunner(ctx context.Context, runner string) (container.Runner, error) {
 	return nil, fmt.Errorf("runner %q not supported", runner)
 }
 
-// https://go-review.googlesource.com/c/go/+/547956
-var discard slog.Handler = discardHandler{}
-
-type discardHandler struct{}
-
-func (discardHandler) Enabled(context.Context, slog.Level) bool  { return false }
-func (discardHandler) Handle(context.Context, slog.Record) error { return nil }
-func (d discardHandler) WithAttrs([]slog.Attr) slog.Handler      { return d }
-func (d discardHandler) WithGroup(string) slog.Handler           { return d }
-
 type handler struct {
 	tasks map[string]*task
 	sync.Mutex
 }
 
-func (h *handler) logs(w http.ResponseWriter, r *http.Request, t *task) {
+func (h *handler) dashFragment(w http.ResponseWriter, r *http.Request) {
+	vals := maps.Values(h.tasks)
+	slices.SortFunc(vals, func(a, b *task) int {
+		return strings.Compare(a.pkg, b.pkg)
+	})
+	fmt.Fprintln(w, "<h1>wolfictl build</h1>")
+	fmt.Fprintln(w, "<h2>running</h2>")
+	fmt.Fprintln(w, "<ul>")
+	for _, t := range vals {
+		if t.status == "running" {
+			fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a></li>\n", t.pkg, t.pkg)
+		}
+	}
+	fmt.Fprintln(w, "</ul>")
+
+	fmt.Fprintln(w, "<h2>done</h2>")
+	fmt.Fprintln(w, "<ul>")
+	for _, t := range vals {
+		if t.done {
+			if t.err != nil {
+				fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a>: %v</li>", t.pkg, t.pkg, t.err)
+			} else {
+				fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a>: %s</li>", t.pkg, t.pkg, t.status)
+			}
+		}
+	}
+	fmt.Fprintln(w, "</ul>")
+
+	fmt.Fprintln(w, "<h2>queued</h2>")
+	fmt.Fprintln(w, "<ul>")
+	for _, t := range vals {
+		if t.status == "waiting for semaphore" {
+			fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a></li>", t.pkg, t.pkg)
+		}
+	}
+	fmt.Fprintln(w, "</ul>")
+
+	fmt.Fprintln(w, "<h2>blocked</h2>")
+	fmt.Fprintln(w, "<ul>")
+	for _, t := range vals {
+		if strings.HasPrefix(t.status, "waiting on") {
+			fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a>: %s</li>", t.pkg, t.pkg, t.status)
+		}
+	}
+	fmt.Fprintln(w, "</ul>")
+}
+
+func (h *handler) pkgFragment(w http.ResponseWriter, r *http.Request, pkg string) {
+	t, ok := h.tasks[pkg]
+	if !ok {
+		panic(pkg)
+	}
+	fmt.Fprintf(w, "<h1>%s: %s</h1>\n", pkg, t.status)
+	fmt.Fprintln(w, "<h2>deps</h2>")
+	fmt.Fprintln(w, "<ul>")
+	for pkg, t := range t.deps {
+		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a>: %s</li>\n", pkg, pkg, t.status)
+	}
+	fmt.Fprintf(w, "</ul>\n")
+
+	fmt.Fprintf(w, "<pre>")
+	h.logs(w, r, t, 0)
+	fmt.Fprintf(w, "</pre>")
+}
+
+func (h *handler) logFragment(w http.ResponseWriter, r *http.Request) {
+	pkg := r.URL.Query().Get("pkg")
+	if pkg == "" {
+		panic("missing pkg")
+	}
+
+	t, ok := h.tasks[pkg]
+	if !ok {
+		panic(pkg)
+	}
+
+	if !t.started {
+		// TODO: Return something that polls.
+		return
+	}
+
+	qoffset := r.URL.Query().Get("offset")
+	if qoffset == "" {
+		panic("missing offset")
+	}
+
+	offset, err := strconv.Atoi(qoffset)
+	if err != nil {
+		panic(err)
+	}
+
+	h.logs(w, r, t, int64(offset))
+}
+
+func (h *handler) logs(w http.ResponseWriter, r *http.Request, t *task, offset int64) {
 	if !t.started {
 		return
 	}
@@ -471,11 +556,25 @@ func (h *handler) logs(w http.ResponseWriter, r *http.Request, t *task) {
 	}
 	defer f.Close()
 
-	fmt.Fprintf(w, "<pre>")
-	if _, err := io.Copy(w, f); err != nil {
+	if offset != 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			log.Printf("seeking file failed: %v", err)
+			return
+		}
+	}
+
+	copied, err := io.Copy(w, f)
+	if err != nil {
 		log.Printf("copying err: %v", err)
 	}
-	fmt.Fprintf(w, "</pre>")
+	if !t.done {
+		fmt.Fprintf(w, `<div
+			hx-get="/logs?pkg=%s&offset=%d"
+    	hx-trigger="load delay:1s"
+    	hx-swap="outerHTML show:bottom"
+			>
+			</div>`, t.pkg, offset+copied)
+	}
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -483,84 +582,36 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Lock()
 	defer h.Unlock()
 
+	if r.URL.Path == "/logs" {
+		h.logFragment(w, r)
+		return
+	}
+
 	fmt.Fprintf(w, `<html>
 <head>
 <title>wolfictl build</title>
+<script src="https://unpkg.com/htmx.org@1.9.10" integrity="sha384-D1Kt99CQMDuVetoL1lrYwg5t+9QdHe7NLX/SoJYkXDFfX37iInKRy5xLSi8nO7UC" crossorigin="anonymous"></script>
 </head>
 <body>
 `)
 
 	if pkg := r.URL.Query().Get("pkg"); pkg != "" {
-		t, ok := h.tasks[pkg]
-		if !ok {
-			panic(pkg)
-		}
-		fmt.Fprintf(w, `<h1>%s: %s</h1>`, pkg, t.status)
-		fmt.Fprintf(w, `<h2>deps</h2>`)
-		fmt.Fprintf(w, `<ul>`)
-		for pkg, t := range t.deps {
-			fmt.Fprintf(w, `  <li><a href="/?pkg=%s">%s</a>: %s</li>`, pkg, pkg, t.status)
-		}
-		fmt.Fprintf(w, `</ul>`)
-
-		h.logs(w, r, t)
+		h.pkgFragment(w, r, pkg)
 	} else {
-		vals := maps.Values(h.tasks)
-		slices.SortFunc(vals, func(a, b *task) int {
-			return strings.Compare(a.pkg, b.pkg)
-		})
-		fmt.Fprintf(w, `<h1>wolfictl build</h1>`)
-		fmt.Fprintf(w, `<h2>running</h2>`)
-		fmt.Fprintf(w, `<ul>`)
-		for _, t := range vals {
-			if t.status == "running" {
-				fmt.Fprintf(w, `  <li><a href="/?pkg=%s">%s</a></li>`, t.pkg, t.pkg)
-			}
-		}
-		fmt.Fprintf(w, `</ul>`)
-
-		fmt.Fprintf(w, `<h2>queued</h2>`)
-		fmt.Fprintf(w, `<ul>`)
-		for _, t := range vals {
-			if t.status == "waiting for semaphore" {
-				fmt.Fprintf(w, `  <li><a href="/?pkg=%s">%s</a></li>`, t.pkg, t.pkg)
-			}
-		}
-		fmt.Fprintf(w, `</ul>`)
-
-		fmt.Fprintf(w, `<h2>blocked</h2>`)
-		fmt.Fprintf(w, `<ul>`)
-		for _, t := range vals {
-			if strings.HasPrefix(t.status, "waiting on") {
-				fmt.Fprintf(w, `  <li><a href="/?pkg=%s">%s</a>: %s</li>`, t.pkg, t.pkg, t.status)
-			}
-		}
-		fmt.Fprintf(w, `</ul>`)
-
-		fmt.Fprintf(w, `<h2>done</h2>`)
-		fmt.Fprintf(w, `<ul>`)
-		for _, t := range vals {
-			if t.done {
-				if t.err != nil {
-					fmt.Fprintf(w, `  <li><a href="/?pkg=%s">%s</a>: %v</li>`, t.pkg, t.pkg, t.err)
-				} else {
-					fmt.Fprintf(w, `  <li><a href="/?pkg=%s">%s</a>: %s</li>`, t.pkg, t.pkg, t.status)
-				}
-			}
-		}
-		fmt.Fprintf(w, `</ul>`)
+		h.dashFragment(w, r)
 	}
 
-	fmt.Fprintf(w, `</body>`)
+	fmt.Fprintln(w, "</body>")
+	fmt.Fprintln(w, "</html>")
 }
 
 func (h *handler) addTask(t *task) {
-	h.Lock()
-	defer h.Unlock()
-
 	if h == nil {
 		return
 	}
+
+	h.Lock()
+	defer h.Unlock()
 
 	h.tasks[t.pkg] = t
 }
