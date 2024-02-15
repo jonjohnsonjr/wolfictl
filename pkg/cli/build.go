@@ -5,11 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"chainguard.dev/apko/pkg/build/types"
 	"chainguard.dev/melange/pkg/build"
@@ -17,10 +21,13 @@ import (
 	"chainguard.dev/melange/pkg/container"
 	"chainguard.dev/melange/pkg/container/docker"
 	"github.com/chainguard-dev/clog"
+	"github.com/skratchdot/open-golang/open"
 	"github.com/spf13/cobra"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
 	"go.opentelemetry.io/otel/sdk/trace"
+	"golang.org/x/exp/maps"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/wolfi-dev/wolfictl/pkg/dag"
 )
@@ -30,10 +37,11 @@ func cmdBuild() *cobra.Command {
 	var dir, pipelineDir, runner string
 	var jobs int
 	var dryrun bool
+	var remove bool
+	var web bool
 	var extraKeys, extraRepos []string
 	var traceFile string
 
-	// TODO: allow building only named packages, taking deps into account.
 	// TODO: buildworld bool (build deps vs get them from package repo)
 	// TODO: builddownstream bool (build things that depend on listed packages)
 	cmd := &cobra.Command{
@@ -72,7 +80,14 @@ func cmdBuild() *cobra.Command {
 				pipelineDir = filepath.Join(dir, "pipelines")
 			}
 
-			newTask := func(_ context.Context, pkg string) *task {
+			var h *handler
+			if web {
+				h = &handler{
+					tasks: map[string]*task{},
+				}
+			}
+
+			newTask := func(pkg string) *task {
 				// TODO: Something with ctx.
 				return &task{
 					pkg:         pkg,
@@ -81,9 +96,11 @@ func cmdBuild() *cobra.Command {
 					runner:      runner,
 					archs:       archs,
 					dryrun:      dryrun,
+					remove:      remove,
 					jobch:       jobch,
 					cond:        sync.NewCond(&sync.Mutex{}),
 					deps:        map[string]*task{},
+					h:           h,
 				}
 			}
 
@@ -117,11 +134,8 @@ func cmdBuild() *cobra.Command {
 
 			tasks := map[string]*task{}
 			for _, pkg := range g.Packages() {
-				log := clog.New(log.Handler()).With("package", pkg)
-				ctx := clog.WithLogger(ctx, log)
-
 				if tasks[pkg] == nil {
-					tasks[pkg] = newTask(ctx, pkg)
+					tasks[pkg] = newTask(pkg)
 				}
 				for k, v := range m {
 					// The package list is in the form of "pkg:version",
@@ -131,7 +145,7 @@ func cmdBuild() *cobra.Command {
 							d, _, _ := strings.Cut(dep.Target, ":")
 
 							if tasks[d] == nil {
-								tasks[d] = newTask(ctx, d)
+								tasks[d] = newTask(d)
 							}
 							tasks[pkg].deps[d] = tasks[d]
 						}
@@ -166,19 +180,57 @@ func cmdBuild() *cobra.Command {
 
 			count := len(tasks)
 
-			errs := []error{}
-			for _, todo := range todos {
-				t := tasks[todo]
-				log.Infof("%s status: %q", t.pkg, t.status)
-				if err := t.wait(); err != nil {
-					errs = append(errs, fmt.Errorf("failed to build %s: %w", t.pkg, err))
-					log.Infof("Failed to build %s (%d failures)", t.pkg, len(errs))
-					continue
+			var eg errgroup.Group
+
+			if web {
+				http.Handle("/", h)
+
+				l, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					return err
 				}
-				delete(tasks, t.pkg)
-				log.Infof("Finished building %s (%d/%d)", t.pkg, count-len(tasks), count)
+
+				server := &http.Server{
+					Addr:              l.Addr().String(),
+					ReadHeaderTimeout: 3 * time.Second,
+				}
+
+				log.Infof("%s", l.Addr().String())
+
+				eg.Go(func() error {
+					server.Serve(l)
+					return nil
+				})
+
+				eg.Go(func() error {
+					open.Run(fmt.Sprintf("http://localhost:%d", l.Addr().(*net.TCPAddr).Port))
+					return nil
+				})
+
+				eg.Go(func() error {
+					<-ctx.Done()
+					server.Close()
+					return nil
+				})
 			}
-			return errors.Join(errs...)
+
+			eg.Go(func() error {
+				errs := []error{}
+				for _, todo := range todos {
+					t := tasks[todo]
+					log.Infof("%s status: %q", t.pkg, t.status)
+					if err := t.wait(); err != nil {
+						errs = append(errs, fmt.Errorf("failed to build %s: %w", t.pkg, err))
+						log.Infof("Failed to build %s (%d failures)", t.pkg, len(errs))
+						continue
+					}
+					delete(tasks, t.pkg)
+					log.Infof("Finished building %s (%d/%d)", t.pkg, count-len(tasks), count)
+				}
+				return errors.Join(errs...)
+			})
+
+			return eg.Wait()
 		},
 	}
 
@@ -188,16 +240,20 @@ func cmdBuild() *cobra.Command {
 	cmd.Flags().IntVarP(&jobs, "jobs", "j", 0, "number of jobs to run concurrently (default is GOMAXPROCS)")
 	cmd.Flags().StringSliceVar(&archs, "arch", []string{"x86_64", "aarch64"}, "arch of package to build")
 	cmd.Flags().BoolVar(&dryrun, "dry-run", false, "print commands instead of executing them")
+	cmd.Flags().BoolVar(&remove, "rm", false, "clean up temporary artifacts")
 	cmd.Flags().StringSliceVarP(&extraKeys, "keyring-append", "k", []string{"https://packages.wolfi.dev/os/wolfi-signing.rsa.pub"}, "path to extra keys to include in the build environment keyring")
 	cmd.Flags().StringSliceVarP(&extraRepos, "repository-append", "r", []string{"https://packages.wolfi.dev/os"}, "path to extra repositories to include in the build environment")
 	cmd.Flags().StringVar(&traceFile, "trace", "", "where to write trace output")
+	cmd.Flags().BoolVar(&web, "web", false, "launch a browser")
 	return cmd
 }
 
 type task struct {
 	pkg, dir, pipelineDir, runner string
-	archs                         []string
-	dryrun                        bool
+
+	archs  []string
+	dryrun bool
+	remove bool
 
 	err  error
 	deps map[string]*task
@@ -209,9 +265,14 @@ type task struct {
 	done    bool
 
 	cond *sync.Cond
+
+	h *handler
 }
 
 func (t *task) start(ctx context.Context) {
+	log := clog.New(clog.FromContext(ctx).Handler()).With("package", t.pkg)
+	ctx = clog.WithLogger(ctx, log)
+
 	defer func() {
 		t.cond.L.Lock()
 		clog.FromContext(ctx).Infof("finished %q, err=%v", t.pkg, t.err)
@@ -233,7 +294,7 @@ func (t *task) start(ctx context.Context) {
 		}
 	}
 
-	t.status = "waiting on jobch"
+	t.status = "waiting for semaphore"
 
 	// Block on jobch, to limit concurrency. Remove from jobch when done.
 	t.jobch <- struct{}{}
@@ -264,9 +325,7 @@ func (t *task) do(ctx context.Context) error {
 	for _, arch := range t.archs {
 		arch := types.ParseArchitecture(arch).ToAPK()
 
-		// TODO: Handle these logs in an interesting way instead of discarding them.
 		log := clog.New(clog.FromContext(ctx).Handler()).With("arch", arch)
-
 		ctx := clog.WithLogger(ctx, log)
 
 		// See if we already have the package built.
@@ -312,7 +371,7 @@ func (t *task) do(ctx context.Context) error {
 			// build.WithCacheSource("gs://wolfi-sources/"), // TODO: flag
 			// build.WithCacheDir("./melange-cache/"),       // TODO: flag
 			build.WithOutDir(filepath.Join(t.dir, "packages")),
-			build.WithRemove(true),
+			build.WithRemove(t.remove),
 		)
 		if err != nil {
 			return err
@@ -337,6 +396,7 @@ func (t *task) maybeStart(ctx context.Context) {
 	if !t.started {
 		clog.FromContext(ctx).Infof("starting %s", t.pkg)
 		t.started = true
+		t.h.addTask(t)
 		go t.start(ctx)
 	}
 }
@@ -371,3 +431,93 @@ func (discardHandler) Enabled(context.Context, slog.Level) bool  { return false 
 func (discardHandler) Handle(context.Context, slog.Record) error { return nil }
 func (d discardHandler) WithAttrs([]slog.Attr) slog.Handler      { return d }
 func (d discardHandler) WithGroup(string) slog.Handler           { return d }
+
+type handler struct {
+	tasks map[string]*task
+	sync.Mutex
+}
+
+func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Less coarse.
+	h.Lock()
+	defer h.Unlock()
+
+	fmt.Fprintf(w, `<html>
+<head>
+<title>wolfictl build</title>
+</head>
+<body>
+`)
+
+	if pkg := r.URL.Query().Get("pkg"); pkg != "" {
+		t, ok := h.tasks[pkg]
+		if !ok {
+			panic(pkg)
+		}
+		fmt.Fprintf(w, `<h1>%s: %s</h1>`, pkg, t.status)
+		fmt.Fprintf(w, `<h2>deps</h2>`)
+		fmt.Fprintf(w, `<ul>`)
+		for pkg, t := range t.deps {
+			fmt.Fprintf(w, `  <li><a href="/?pkg=%s">%s</a>: %s</li>`, pkg, pkg, t.status)
+		}
+		fmt.Fprintf(w, `</ul>`)
+	} else {
+		vals := maps.Values(h.tasks)
+		slices.SortFunc(vals, func(a, b *task) int {
+			return strings.Compare(a.pkg, b.pkg)
+		})
+		fmt.Fprintf(w, `<h1>wolfictl build</h1>`)
+		fmt.Fprintf(w, `<h2>running</h2>`)
+		fmt.Fprintf(w, `<ul>`)
+		for _, t := range vals {
+			if t.status == "running" {
+				fmt.Fprintf(w, `  <li><a href="/?pkg=%s">%s</a></li>`, t.pkg, t.pkg)
+			}
+		}
+		fmt.Fprintf(w, `</ul>`)
+
+		fmt.Fprintf(w, `<h2>queued</h2>`)
+		fmt.Fprintf(w, `<ul>`)
+		for _, t := range vals {
+			if t.status == "waiting for semaphore" {
+				fmt.Fprintf(w, `  <li><a href="/?pkg=%s">%s</a></li>`, t.pkg, t.pkg)
+			}
+		}
+		fmt.Fprintf(w, `</ul>`)
+
+		fmt.Fprintf(w, `<h2>blocked</h2>`)
+		fmt.Fprintf(w, `<ul>`)
+		for _, t := range vals {
+			if strings.HasPrefix(t.status, "waiting on") {
+				fmt.Fprintf(w, `  <li><a href="/?pkg=%s">%s</a>: %s</li>`, t.pkg, t.pkg, t.status)
+			}
+		}
+		fmt.Fprintf(w, `</ul>`)
+
+		fmt.Fprintf(w, `<h2>done</h2>`)
+		fmt.Fprintf(w, `<ul>`)
+		for _, t := range vals {
+			if t.done {
+				if t.err != nil {
+					fmt.Fprintf(w, `  <li><a href="/?pkg=%s">%s</a>: %v</li>`, t.pkg, t.pkg, t.err)
+				} else {
+					fmt.Fprintf(w, `  <li><a href="/?pkg=%s">%s</a>: %s</li>`, t.pkg, t.pkg, t.status)
+				}
+			}
+		}
+		fmt.Fprintf(w, `</ul>`)
+	}
+
+	fmt.Fprintf(w, `</body>`)
+}
+
+func (h *handler) addTask(t *task) {
+	h.Lock()
+	defer h.Unlock()
+
+	if h == nil {
+		return
+	}
+
+	h.tasks[t.pkg] = t
+}
