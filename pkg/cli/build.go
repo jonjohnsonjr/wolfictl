@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -71,6 +73,12 @@ func cmdBuild() *cobra.Command {
 				ctx = tctx
 			}
 
+			tmpdir, err := os.MkdirTemp("", "wolfictl-build-logs")
+			if err != nil {
+				return err
+			}
+			defer os.RemoveAll(tmpdir)
+
 			if jobs == 0 {
 				jobs = runtime.GOMAXPROCS(0)
 			}
@@ -101,6 +109,7 @@ func cmdBuild() *cobra.Command {
 					cond:        sync.NewCond(&sync.Mutex{}),
 					deps:        map[string]*task{},
 					h:           h,
+					tmpdir:      tmpdir,
 				}
 			}
 
@@ -267,12 +276,11 @@ type task struct {
 	cond *sync.Cond
 
 	h *handler
+
+	tmpdir string
 }
 
 func (t *task) start(ctx context.Context) {
-	log := clog.New(clog.FromContext(ctx).Handler()).With("package", t.pkg)
-	ctx = clog.WithLogger(ctx, log)
-
 	defer func() {
 		t.cond.L.Lock()
 		clog.FromContext(ctx).Infof("finished %q, err=%v", t.pkg, t.err)
@@ -285,6 +293,9 @@ func (t *task) start(ctx context.Context) {
 	for _, dep := range t.deps {
 		dep.maybeStart(ctx)
 	}
+
+	log := clog.New(clog.FromContext(ctx).Handler()).With("package", t.pkg)
+	ctx = clog.WithLogger(ctx, log)
 
 	for depname, dep := range t.deps {
 		t.status = "waiting on " + depname
@@ -307,12 +318,24 @@ func (t *task) start(ctx context.Context) {
 	t.err = t.do(ctx)
 }
 
+func (t *task) logfile() string {
+	return filepath.Join(t.tmpdir, t.pkg+".txt")
+}
+
 func (t *task) do(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		_, span := otel.Tracer("wolfictl").Start(ctx, "build "+t.pkg+" (canceled)")
 		defer span.End()
 		return err
 	}
+
+	f, err := os.Create(t.logfile())
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	ctx = clog.WithLogger(ctx, clog.New(slog.NewTextHandler(f, nil)))
 
 	ctx, span := otel.Tracer("wolfictl").Start(ctx, "build "+t.pkg)
 	defer span.End()
@@ -437,6 +460,24 @@ type handler struct {
 	sync.Mutex
 }
 
+func (h *handler) logs(w http.ResponseWriter, r *http.Request, t *task) {
+	if !t.started {
+		return
+	}
+	f, err := os.Open(t.logfile())
+	if err != nil {
+		log.Printf("opening file failed: %v", err)
+		return
+	}
+	defer f.Close()
+
+	fmt.Fprintf(w, "<pre>")
+	if _, err := io.Copy(w, f); err != nil {
+		log.Printf("copying err: %v", err)
+	}
+	fmt.Fprintf(w, "</pre>")
+}
+
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Less coarse.
 	h.Lock()
@@ -461,6 +502,8 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, `  <li><a href="/?pkg=%s">%s</a>: %s</li>`, pkg, pkg, t.status)
 		}
 		fmt.Fprintf(w, `</ul>`)
+
+		h.logs(w, r, t)
 	} else {
 		vals := maps.Values(h.tasks)
 		slices.SortFunc(vals, func(a, b *task) int {
