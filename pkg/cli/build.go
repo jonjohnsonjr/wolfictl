@@ -279,6 +279,7 @@ type task struct {
 
 	started bool
 	done    bool
+	skipped bool
 
 	cond *sync.Cond
 
@@ -290,7 +291,11 @@ type task struct {
 func (t *task) start(ctx context.Context) {
 	defer func() {
 		t.cond.L.Lock()
-		clog.FromContext(ctx).Infof("finished %q, err=%v", t.pkg, t.err)
+		if t.err != nil {
+			clog.FromContext(ctx).Infof("%s failed: %v", t.pkg, t.err)
+		} else {
+			clog.FromContext(ctx).Infof("finished %s", t.pkg)
+		}
 		t.status = "done"
 		t.done = true
 		t.cond.Broadcast()
@@ -315,7 +320,7 @@ func (t *task) start(ctx context.Context) {
 	t.jobch <- struct{}{}
 	defer func() { <-t.jobch }()
 
-	clog.FromContext(ctx).Infof("starting %q", t.pkg)
+	clog.FromContext(ctx).Infof("starting %s", t.pkg)
 	t.status = "running"
 
 	// all deps are done and we're clear to launch.
@@ -427,7 +432,6 @@ func (t *task) maybeStart(ctx context.Context) {
 	defer t.cond.L.Unlock()
 
 	if !t.started {
-		clog.FromContext(ctx).Infof("starting %s", t.pkg)
 		t.started = true
 		t.h.addTask(t)
 		go t.start(ctx)
