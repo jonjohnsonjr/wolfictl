@@ -24,6 +24,7 @@ import (
 	"chainguard.dev/melange/pkg/container"
 	"chainguard.dev/melange/pkg/container/docker"
 	"github.com/chainguard-dev/clog"
+	charmlog "github.com/charmbracelet/log"
 	"github.com/skratchdot/open-golang/open"
 	"github.com/spf13/cobra"
 	"go.opentelemetry.io/otel"
@@ -52,7 +53,6 @@ func cmdBuild() *cobra.Command {
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
-			log := clog.FromContext(ctx)
 
 			if traceFile != "" {
 				w, err := os.Create(traceFile)
@@ -114,11 +114,14 @@ func cmdBuild() *cobra.Command {
 				}
 			}
 
-			pkgs, err := dag.NewPackages(ctx, os.DirFS(dir), dir, pipelineDir)
+			// We want to ignore info level here during setup, but further down below we pull whatever was passed to use via ctx.
+			log := clog.New(charmlog.NewWithOptions(os.Stderr, charmlog.Options{ReportTimestamp: true, Level: charmlog.Level(charmlog.WarnLevel)}))
+			setupCtx := clog.WithLogger(ctx, log)
+			pkgs, err := dag.NewPackages(setupCtx, os.DirFS(dir), dir, pipelineDir)
 			if err != nil {
 				return err
 			}
-			g, err := dag.NewGraph(ctx, pkgs,
+			g, err := dag.NewGraph(setupCtx, pkgs,
 				dag.WithKeys(extraKeys...),
 				dag.WithRepos(extraRepos...))
 			if err != nil {
@@ -141,6 +144,9 @@ func cmdBuild() *cobra.Command {
 			if err != nil {
 				return err
 			}
+
+			// Back to normal logger.
+			log = clog.FromContext(ctx)
 
 			tasks := map[string]*task{}
 			for _, pkg := range g.Packages() {
@@ -556,13 +562,13 @@ func (h *handler) logFragment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !t.started {
-		// TODO: Return something that polls.
 		return
 	}
 
 	qoffset := r.URL.Query().Get("offset")
 	if qoffset == "" {
-		panic("missing offset")
+		log.Printf("missing offset")
+		return
 	}
 
 	offset, err := strconv.Atoi(qoffset)
@@ -606,7 +612,7 @@ func (h *handler) logs(w http.ResponseWriter, r *http.Request, t *task, offset i
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Less coarse.
+	// TODO: Less coarse locking.
 	h.Lock()
 	defer h.Unlock()
 
