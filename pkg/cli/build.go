@@ -4,12 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"chainguard.dev/apko/pkg/build/types"
 	"chainguard.dev/melange/pkg/build"
@@ -18,11 +25,13 @@ import (
 	"chainguard.dev/melange/pkg/container/docker"
 	"github.com/chainguard-dev/clog"
 	charmlog "github.com/charmbracelet/log"
+	"github.com/skratchdot/open-golang/open"
 	"github.com/spf13/cobra"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
 	"go.opentelemetry.io/otel/sdk/trace"
 	"golang.org/x/exp/maps"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/wolfi-dev/wolfictl/pkg/dag"
 )
@@ -32,6 +41,8 @@ func cmdBuild() *cobra.Command {
 	var dir, pipelineDir, runner string
 	var jobs int
 	var dryrun bool
+	var remove bool
+	var web bool
 	var extraKeys, extraRepos []string
 	var traceFile string
 
@@ -76,6 +87,13 @@ func cmdBuild() *cobra.Command {
 				pipelineDir = filepath.Join(dir, "pipelines")
 			}
 
+			var h *handler
+			if web {
+				h = &handler{
+					tasks: map[string]*task{},
+				}
+			}
+
 			// Logs will go here to mimic the wolfi Makefile.
 			for _, arch := range archs {
 				archDir := logdir(dir, arch)
@@ -92,14 +110,16 @@ func cmdBuild() *cobra.Command {
 					runner:      runner,
 					archs:       archs,
 					dryrun:      dryrun,
+					remove:      remove,
+					jobch:       jobch,
 					cond:        sync.NewCond(&sync.Mutex{}),
 					deps:        map[string]*task{},
-					jobch:       jobch,
+					h:           h,
 				}
 			}
 
 			// We want to ignore info level here during setup, but further down below we pull whatever was passed to use via ctx.
-			log := clog.New(charmlog.NewWithOptions(os.Stderr, charmlog.Options{ReportTimestamp: true, Level: charmlog.WarnLevel}))
+			log := clog.New(charmlog.NewWithOptions(os.Stderr, charmlog.Options{ReportTimestamp: true, Level: charmlog.Level(charmlog.WarnLevel)}))
 			setupCtx := clog.WithLogger(ctx, log)
 			pkgs, err := dag.NewPackages(setupCtx, os.DirFS(dir), dir, pipelineDir)
 			if err != nil {
@@ -128,6 +148,9 @@ func cmdBuild() *cobra.Command {
 			if err != nil {
 				return err
 			}
+
+			// Back to normal logger.
+			log = clog.FromContext(ctx)
 
 			tasks := map[string]*task{}
 			for _, pkg := range g.Packages() {
@@ -168,26 +191,61 @@ func cmdBuild() *cobra.Command {
 			}
 			count := len(todos)
 
-			// We're ok with Info level from here on.
-			log = clog.FromContext(ctx)
+			var eg errgroup.Group
 
-			errs := []error{}
-			for _, t := range todos {
-				if err := t.wait(); err != nil {
-					errs = append(errs, fmt.Errorf("failed to build %s: %w", t.pkg, err))
-					continue
+			if web {
+				http.Handle("/", h)
+
+				l, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					return err
 				}
 
-				delete(todos, t.pkg)
-				log.Infof("Finished building %s (%d/%d)", t.pkg, count-len(todos), count)
+				server := &http.Server{
+					Addr:              l.Addr().String(),
+					ReadHeaderTimeout: 3 * time.Second,
+				}
+
+				log.Infof("%s", l.Addr().String())
+
+				eg.Go(func() error {
+					server.Serve(l)
+					return nil
+				})
+
+				eg.Go(func() error {
+					open.Run(fmt.Sprintf("http://localhost:%d", l.Addr().(*net.TCPAddr).Port))
+					return nil
+				})
+
+				eg.Go(func() error {
+					<-ctx.Done()
+					server.Close()
+					return nil
+				})
 			}
 
-			// If the context is cancelled, it's not useful to print everything, just summarize the count.
-			if err := ctx.Err(); err != nil {
-				return fmt.Errorf("failed to build %d packages: %w", len(errs), err)
-			}
+			eg.Go(func() error {
+				errs := []error{}
+				for _, t := range todos {
+					if err := t.wait(); err != nil {
+						errs = append(errs, fmt.Errorf("failed to build %s: %w", t.pkg, err))
+						continue
+					}
 
-			return errors.Join(errs...)
+					delete(tasks, t.pkg)
+					log.Infof("Finished building %s (%d/%d)", t.pkg, count-len(tasks), count)
+				}
+
+				// If the context is cancelled, it's not useful to print everything, just summarize the count.
+				if err := ctx.Err(); err != nil {
+					return fmt.Errorf("failed to build %d packages: %w", len(errs), err)
+				}
+
+				return errors.Join(errs...)
+			})
+
+			return eg.Wait()
 		},
 	}
 
@@ -197,25 +255,36 @@ func cmdBuild() *cobra.Command {
 	cmd.Flags().IntVarP(&jobs, "jobs", "j", 0, "number of jobs to run concurrently (default is GOMAXPROCS)")
 	cmd.Flags().StringSliceVar(&archs, "arch", []string{"x86_64", "aarch64"}, "arch of package to build")
 	cmd.Flags().BoolVar(&dryrun, "dry-run", false, "print commands instead of executing them")
+	cmd.Flags().BoolVar(&remove, "rm", false, "clean up temporary artifacts")
 	cmd.Flags().StringSliceVarP(&extraKeys, "keyring-append", "k", []string{"https://packages.wolfi.dev/os/wolfi-signing.rsa.pub"}, "path to extra keys to include in the build environment keyring")
 	cmd.Flags().StringSliceVarP(&extraRepos, "repository-append", "r", []string{"https://packages.wolfi.dev/os"}, "path to extra repositories to include in the build environment")
 	cmd.Flags().StringVar(&traceFile, "trace", "", "where to write trace output")
+	cmd.Flags().BoolVar(&web, "web", false, "launch a browser")
 	return cmd
 }
 
 type task struct {
 	pkg, dir, pipelineDir, runner string
-	archs                         []string
-	dryrun                        bool
+
+	archs  []string
+	dryrun bool
+	remove bool
 
 	err  error
 	deps map[string]*task
 
-	cond    *sync.Cond
+	jobch  chan struct{}
+	status string
+
 	started bool
 	done    bool
+	skipped bool
 
-	jobch chan struct{}
+	cond *sync.Cond
+
+	h *handler
+
+	cfg *config.Configuration
 }
 
 func (t *task) start(ctx context.Context) {
@@ -235,31 +304,45 @@ func (t *task) start(ctx context.Context) {
 		clog.FromContext(ctx).Infof("task %q waiting on %q", t.pkg, maps.Keys(t.deps))
 	}
 
-	for _, dep := range t.deps {
+	for depname, dep := range t.deps {
+		t.status = "waiting on " + depname
 		if err := dep.wait(); err != nil {
 			t.err = err
 			return
 		}
 	}
 
+	t.status = "waiting for semaphore"
+
 	// Block on jobch, to limit concurrency. Remove from jobch when done.
 	t.jobch <- struct{}{}
 	defer func() { <-t.jobch }()
+
+	clog.FromContext(ctx).Infof("starting %s", t.pkg)
+	t.status = "running"
 
 	// all deps are done and we're clear to launch.
 	t.err = t.build(ctx)
 }
 
 func (t *task) build(ctx context.Context) error {
+	log := clog.New(clog.FromContext(ctx).Handler()).With("package", t.pkg)
+	ctx = clog.WithLogger(ctx, log)
+
 	if err := ctx.Err(); err != nil {
+		_, span := otel.Tracer("wolfictl").Start(ctx, "build "+t.pkg+" (canceled)")
+		defer span.End()
 		return err
 	}
 
-	log := clog.FromContext(ctx)
+	ctx, span := otel.Tracer("wolfictl").Start(ctx, "build "+t.pkg)
+	defer span.End()
+
 	cfg, err := config.ParseConfiguration(ctx, fmt.Sprintf("%s.yaml", t.pkg), config.WithFS(os.DirFS(t.dir)))
 	if err != nil {
 		return fmt.Errorf("failed to parse config: %w", err)
 	}
+	t.cfg = cfg
 
 	for _, arch := range t.archs {
 		arch := types.ParseArchitecture(arch).ToAPK()
@@ -322,10 +405,10 @@ func (t *task) build(ctx context.Context) error {
 			build.WithEnvFile(filepath.Join(t.dir, fmt.Sprintf("build-%s.env", arch))),
 			build.WithNamespace("wolfi"), // TODO: flag
 			build.WithSourceDir(sdir),
-			build.WithCacheSource("gs://wolfi-sources/"), // TODO: flag
-			build.WithCacheDir("./melange-cache/"),       // TODO: flag
+			// build.WithCacheSource("gs://wolfi-sources/"), // TODO: flag
+			// build.WithCacheDir("./melange-cache/"),       // TODO: flag
 			build.WithOutDir(filepath.Join(t.dir, "packages")),
-			build.WithRemove(true),
+			build.WithRemove(t.remove),
 		)
 		if err != nil {
 			return err
@@ -351,6 +434,11 @@ func (t *task) build(ctx context.Context) error {
 	return nil
 }
 
+func (t *task) logfile(arch string) string {
+	pkgver := fmt.Sprintf("%s-%s-r%d", t.cfg.Package.Name, t.cfg.Package.Version, t.cfg.Package.Epoch)
+	return filepath.Join(logdir(t.dir, arch), pkgver) + ".log"
+}
+
 // If this task hasn't already been started, start it.
 func (t *task) maybeStart(ctx context.Context) {
 	t.cond.L.Lock()
@@ -358,6 +446,7 @@ func (t *task) maybeStart(ctx context.Context) {
 
 	if !t.started {
 		t.started = true
+		t.h.addTask(t)
 		go t.start(ctx)
 	}
 }
@@ -387,3 +476,307 @@ func newRunner(ctx context.Context, runner string) (container.Runner, error) {
 func logdir(dir, arch string) string {
 	return filepath.Join(dir, "packages", arch, "buildlogs")
 }
+
+type handler struct {
+	tasks map[string]*task
+	sync.Mutex
+}
+
+func (h *handler) dashFragment(w http.ResponseWriter, r *http.Request) {
+	vals := maps.Values(h.tasks)
+	slices.SortFunc(vals, func(a, b *task) int {
+		return strings.Compare(a.pkg, b.pkg)
+	})
+	fmt.Fprintln(w, "<h1>wolfictl build</h1>")
+
+	running := []*task{}
+	failed := []*task{}
+	done := []*task{}
+	queued := []*task{}
+	blocked := []*task{}
+	for _, t := range vals {
+		if t.done {
+			if t.err != nil {
+				failed = append(failed, t)
+			} else {
+				done = append(done, t)
+			}
+		} else if t.status == "running" {
+			running = append(running, t)
+		} else if t.status == "waiting for semaphore" {
+			queued = append(queued, t)
+		} else if strings.HasPrefix(t.status, "waiting on") {
+			blocked = append(blocked, t)
+		}
+	}
+
+	fmt.Fprintln(w, "<h2>running</h2>")
+	fmt.Fprintln(w, "<ul>")
+	for _, t := range running {
+		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a></li>\n", t.pkg, t.pkg)
+	}
+	fmt.Fprintln(w, "</ul>")
+
+	fmt.Fprintln(w, "<details>")
+	fmt.Fprintf(w, "<summary><h2>failed (%d)</h2></summary>\n", len(failed))
+	fmt.Fprintln(w, "<ul>")
+	for _, t := range failed {
+		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a>: %v</li>", t.pkg, t.pkg, t.err)
+	}
+	fmt.Fprintln(w, "</ul>")
+	fmt.Fprintln(w, "</details>")
+
+	fmt.Fprintln(w, "<details>")
+	fmt.Fprintf(w, "<summary><h2>done (%d)</h2></summary>\n", len(done))
+	fmt.Fprintln(w, "<ul>")
+	for _, t := range done {
+		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a>: %s</li>", t.pkg, t.pkg, t.status)
+	}
+	fmt.Fprintln(w, "</ul>")
+	fmt.Fprintln(w, "</details>")
+
+	fmt.Fprintln(w, "<details>")
+	fmt.Fprintf(w, "<summary><h2>queued (%d)</h2></summary>\n", len(queued))
+	fmt.Fprintln(w, "<ul>")
+	for _, t := range queued {
+		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a></li>", t.pkg, t.pkg)
+	}
+	fmt.Fprintln(w, "</ul>")
+	fmt.Fprintln(w, "</details>")
+
+	fmt.Fprintln(w, "<details>")
+	fmt.Fprintf(w, "<summary><h2>blocked (%d)</h2></summary>\n", len(blocked))
+	fmt.Fprintln(w, "<ul>")
+	for _, t := range blocked {
+		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a>: %s</li>", t.pkg, t.pkg, t.status)
+	}
+	fmt.Fprintln(w, "</ul>")
+	fmt.Fprintln(w, "</details>")
+}
+
+func (h *handler) pkgFragment(w http.ResponseWriter, r *http.Request, pkg string) {
+	t, ok := h.tasks[pkg]
+	if !ok {
+		panic(pkg)
+	}
+	fmt.Fprintf(w, "<h1>%s: %s</h1>\n", pkg, t.status)
+	if len(t.deps) != 0 {
+		fmt.Fprintln(w, "<h2>deps</h2>")
+		fmt.Fprintln(w, "<ul>")
+		for pkg, t := range t.deps {
+			fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a>: %s</li>\n", pkg, pkg, t.status)
+		}
+		fmt.Fprintf(w, "</ul>\n")
+	}
+
+	fmt.Fprintln(w, "<h2>logs</h2>")
+	fmt.Fprintf(w, "<pre>")
+	h.logs(w, r, t, 0)
+	fmt.Fprintf(w, "</pre>")
+}
+
+func (h *handler) logFragment(w http.ResponseWriter, r *http.Request) {
+	pkg := r.URL.Query().Get("pkg")
+	if pkg == "" {
+		panic("missing pkg")
+	}
+
+	t, ok := h.tasks[pkg]
+	if !ok {
+		panic(pkg)
+	}
+
+	if !t.started {
+		return
+	}
+
+	qoffset := r.URL.Query().Get("offset")
+	if qoffset == "" {
+		log.Printf("missing offset")
+		return
+	}
+
+	offset, err := strconv.Atoi(qoffset)
+	if err != nil {
+		panic(err)
+	}
+
+	h.logs(w, r, t, int64(offset))
+}
+
+func (h *handler) logs(w http.ResponseWriter, r *http.Request, t *task, offset int64) {
+	if !t.started {
+		return
+	}
+
+	// TODO: Handle arch.
+	f, err := os.Open(t.logfile("aarch64"))
+	if err != nil {
+		log.Printf("opening file failed: %v", err)
+		return
+	}
+	defer f.Close()
+
+	if offset != 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			log.Printf("seeking file failed: %v", err)
+			return
+		}
+	}
+
+	copied, err := io.Copy(w, f)
+	if err != nil {
+		log.Printf("copying err: %v", err)
+	}
+	if !t.done {
+		href := fmt.Sprintf("/logs?pkg=%s&offset=%d", t.pkg, offset+copied)
+		fmt.Fprintf(w, `<div hx-get=%q hx-trigger="load delay:1s" hx-swap="outerHTML show:bottom"></div>`, href)
+	}
+}
+
+func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// TODO: Less coarse locking.
+	h.Lock()
+	defer h.Unlock()
+
+	if r.URL.Path == "/logs" {
+		h.logFragment(w, r)
+		return
+	}
+
+	fmt.Fprintf(w, `<html>
+<head>
+<title>wolfictl build</title>
+<script src="https://unpkg.com/htmx.org@1.9.10" integrity="sha384-D1Kt99CQMDuVetoL1lrYwg5t+9QdHe7NLX/SoJYkXDFfX37iInKRy5xLSi8nO7UC" crossorigin="anonymous"></script>
+%s
+</head>
+<body>
+`, style)
+
+	if pkg := r.URL.Query().Get("pkg"); pkg != "" {
+		h.pkgFragment(w, r, pkg)
+	} else {
+		h.dashFragment(w, r)
+	}
+
+	fmt.Fprintln(w, "</body>")
+	fmt.Fprintln(w, "</html>")
+}
+
+func (h *handler) addTask(t *task) {
+	if h == nil {
+		return
+	}
+
+	h.Lock()
+	defer h.Unlock()
+
+	h.tasks[t.pkg] = t
+}
+
+const style = `<style>
+body {
+  color-scheme: dark;
+  background: black;
+  color: white;
+  padding-left: 10%;
+  padding-right: 10%;
+  padding-top: 100px;
+  font-family: "Helvetica Neue", "Arial";
+}
+
+body > img {
+  position: absolute;
+  left: 10%;
+  top: 10;
+  height: 50px;
+}
+
+pre {
+  display: inline-block;
+  font-size: 14px;
+  align-content: center;
+  margin: 0;
+  margin-top: 3px;
+  margin-right: 12px;
+  margin-left: 3px;
+}
+
+h1 {
+  text-align: center;
+  margin-bottom: 80px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+h2 {
+  text-transform: capitalize;
+  padding-top: 5px;
+}
+
+ul {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  list-style-type: none;
+  padding-left: 0;
+  padding-bottom: 50px;
+  row-gap: 10px;
+  column-gap: 40px;
+}
+
+li,
+a {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+ul:nth-of-type(2),
+ul:nth-of-type(4) {
+  display: table;
+  table-layout: fixed;
+  flex-direction: column;
+  width: 100%;
+}
+ul:nth-of-type(2) > li,
+ul:nth-of-type(4) > li {
+  display: table-row;
+  width: 100%;
+}
+ul:nth-of-type(2) > li > a,
+ul:nth-of-type(4) > li > a {
+  display: table-cell;
+  width: 33%;
+  padding-bottom: 10px;
+}
+
+@keyframes pending {
+  0% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.7;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+ul:nth-of-type(1),
+ul:nth-of-type(3) {
+  animation: pending 2s ease-in-out infinite;
+}
+
+ul:nth-of-type(4) {
+  color: orange;
+}
+
+details summary {
+  cursor: pointer;
+}
+
+details summary > * {
+  display: inline;
+}
+</style>`
