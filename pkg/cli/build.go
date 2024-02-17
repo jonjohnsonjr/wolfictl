@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -99,6 +100,8 @@ func cmdBuild() *cobra.Command {
 				}
 			}
 
+			var eg errgroup.Group
+
 			// Logs will go here to mimic the wolfi Makefile.
 			for _, arch := range archs {
 				archDir := logdir(dir, arch)
@@ -154,7 +157,7 @@ func cmdBuild() *cobra.Command {
 				}
 
 				// Back to normal logger.
-				log = clog.FromContext(ctx)
+				log = clog.FromContext(ctx).With("arch", arch)
 
 				tasks := map[string]*task{}
 				for _, pkg := range g.Packages() {
@@ -195,40 +198,6 @@ func cmdBuild() *cobra.Command {
 				}
 				count := len(todos)
 
-				var eg errgroup.Group
-
-				if web {
-					http.Handle("/", h)
-
-					l, err := net.Listen("tcp", "127.0.0.1:0")
-					if err != nil {
-						return err
-					}
-
-					server := &http.Server{
-						Addr:              l.Addr().String(),
-						ReadHeaderTimeout: 3 * time.Second,
-					}
-
-					log.Infof("%s", l.Addr().String())
-
-					eg.Go(func() error {
-						server.Serve(l)
-						return nil
-					})
-
-					eg.Go(func() error {
-						open.Run(fmt.Sprintf("http://localhost:%d", l.Addr().(*net.TCPAddr).Port))
-						return nil
-					})
-
-					eg.Go(func() error {
-						<-ctx.Done()
-						server.Close()
-						return nil
-					})
-				}
-
 				eg.Go(func() error {
 					errs := []error{}
 					for _, t := range todos {
@@ -237,8 +206,8 @@ func cmdBuild() *cobra.Command {
 							continue
 						}
 
-						delete(tasks, t.pkg)
-						log.Infof("Finished building %s (%d/%d)", t.pkg, count-len(tasks), count)
+						delete(todos, t.pkg)
+						log.Infof("Finished building %s (%d/%d)", t.pkg, count-len(todos), count)
 					}
 
 					// If the context is cancelled, it's not useful to print everything, just summarize the count.
@@ -248,12 +217,41 @@ func cmdBuild() *cobra.Command {
 
 					return errors.Join(errs...)
 				})
-
-				return eg.Wait()
 			}
 
-			// TODO: eg.wait
-			return nil
+			if web {
+				http.Handle("/", h)
+
+				l, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					return err
+				}
+
+				server := &http.Server{
+					Addr:              l.Addr().String(),
+					ReadHeaderTimeout: 3 * time.Second,
+				}
+
+				clog.FromContext(ctx).Infof("%s", l.Addr().String())
+
+				eg.Go(func() error {
+					server.Serve(l)
+					return nil
+				})
+
+				eg.Go(func() error {
+					open.Run(fmt.Sprintf("http://localhost:%d", l.Addr().(*net.TCPAddr).Port))
+					return nil
+				})
+
+				eg.Go(func() error {
+					<-ctx.Done()
+					server.Close()
+					return nil
+				})
+			}
+
+			return eg.Wait()
 		},
 	}
 
@@ -354,12 +352,8 @@ func (t *task) build(ctx context.Context) error {
 
 	arch := types.ParseArchitecture(t.arch).ToAPK()
 
-	pkgver := fmt.Sprintf("%s-%s-r%d", cfg.Package.Name, cfg.Package.Version, cfg.Package.Epoch)
-	logDir := logdir(t.dir, arch)
-	logfile := filepath.Join(logDir, pkgver) + ".log"
-
 	// See if we already have the package built.
-	apk := pkgver + ".apk"
+	apk := fmt.Sprintf("%s-%s-r%d.apk", cfg.Package.Name, cfg.Package.Version, cfg.Package.Epoch)
 	apkPath := filepath.Join(t.dir, "packages", arch, apk)
 	if _, err := os.Stat(apkPath); err == nil {
 		log.Infof("skipping %s, already built", apkPath)
@@ -367,20 +361,14 @@ func (t *task) build(ctx context.Context) error {
 		return nil
 	}
 
-	f, err := os.Create(logfile)
+	f, err := os.Create(t.logfile())
 	if err != nil {
 		return fmt.Errorf("creating logfile: :%w", err)
 	}
 	defer f.Close()
 
-	log = clog.New(slog.NewTextHandler(f, nil)).With("pkg", t.pkg)
+	log = clog.New(slog.NewJSONHandler(f, nil)).With("pkg", t.pkg)
 	fctx := clog.WithLogger(ctx, log)
-
-	// TODO ?
-	// if len(t.archs) > 1 {
-	// 	log = clog.New(log.Handler()).With("arch", arch)
-	// 	fctx = clog.WithLogger(fctx, log)
-	// }
 
 	sdir := filepath.Join(t.dir, t.pkg)
 	if _, err := os.Stat(sdir); os.IsNotExist(err) {
@@ -437,15 +425,18 @@ func (t *task) build(ctx context.Context) error {
 	}()
 
 	if err := bc.BuildPackage(fctx); err != nil {
-		return fmt.Errorf("building package (see %q for logs): %w", logfile, err)
+		return fmt.Errorf("building package (see %q for logs): %w", t.logfile(), err)
 	}
 
 	return nil
 }
 
-func (t *task) logfile(arch string) string {
+func (t *task) logfile() string {
+	if t.cfg == nil {
+		return ""
+	}
 	pkgver := fmt.Sprintf("%s-%s-r%d", t.cfg.Package.Name, t.cfg.Package.Version, t.cfg.Package.Epoch)
-	return filepath.Join(logdir(t.dir, arch), pkgver) + ".log"
+	return filepath.Join(logdir(t.dir, t.arch), pkgver) + ".log"
 }
 
 // If this task hasn't already been started, start it.
@@ -527,7 +518,7 @@ func (h *handler) dashFragment(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "<h2>running</h2>")
 	fmt.Fprintln(w, "<ul>")
 	for _, t := range running {
-		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a></li>\n", t.pkg, t.pkg)
+		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s&arch=%s\">%s</a></li>\n", t.pkg, arch, t.pkg)
 	}
 	fmt.Fprintln(w, "</ul>")
 
@@ -535,7 +526,7 @@ func (h *handler) dashFragment(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "<summary><h2>failed (%d)</h2></summary>\n", len(failed))
 	fmt.Fprintln(w, "<ul>")
 	for _, t := range failed {
-		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a>: %v</li>", t.pkg, t.pkg, t.err)
+		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s&arch=%s\">%s</a>: %v</li>", t.pkg, t.pkg, arch, t.err)
 	}
 	fmt.Fprintln(w, "</ul>")
 	fmt.Fprintln(w, "</details>")
@@ -544,7 +535,7 @@ func (h *handler) dashFragment(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "<summary><h2>done (%d)</h2></summary>\n", len(done))
 	fmt.Fprintln(w, "<ul>")
 	for _, t := range done {
-		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a>: %s</li>", t.pkg, t.pkg, t.status)
+		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s&arch=%s\">%s</a>: %s</li>", t.pkg, arch, t.pkg, t.status)
 	}
 	fmt.Fprintln(w, "</ul>")
 	fmt.Fprintln(w, "</details>")
@@ -553,7 +544,7 @@ func (h *handler) dashFragment(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "<summary><h2>queued (%d)</h2></summary>\n", len(queued))
 	fmt.Fprintln(w, "<ul>")
 	for _, t := range queued {
-		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a></li>", t.pkg, t.pkg)
+		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s&arch=%s\">%s</a></li>", t.pkg, arch, t.pkg)
 	}
 	fmt.Fprintln(w, "</ul>")
 	fmt.Fprintln(w, "</details>")
@@ -562,7 +553,7 @@ func (h *handler) dashFragment(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "<summary><h2>blocked (%d)</h2></summary>\n", len(blocked))
 	fmt.Fprintln(w, "<ul>")
 	for _, t := range blocked {
-		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a>: %s</li>", t.pkg, t.pkg, t.status)
+		fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s&arch=%s\">%s</a>: %s</li>", t.pkg, arch, t.pkg, t.status)
 	}
 	fmt.Fprintln(w, "</ul>")
 	fmt.Fprintln(w, "</details>")
@@ -585,12 +576,13 @@ func (h *handler) pkgFragment(w http.ResponseWriter, r *http.Request, pkg string
 		fmt.Fprintln(w, "<h2>deps</h2>")
 		fmt.Fprintln(w, "<ul>")
 		for pkg, t := range t.deps {
-			fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s\">%s</a>: %s</li>\n", pkg, pkg, t.status)
+			fmt.Fprintf(w, "\t<li><span><a href=\"/?pkg=%s&arch=%s\">%s</a>: %s</span></li>\n", pkg, arch, pkg, t.status)
 		}
 		fmt.Fprintf(w, "</ul>\n")
 	}
 
 	fmt.Fprintln(w, "<h2>logs</h2>")
+	fmt.Fprintf(w, "<p>$ tail -f %s | jq -r '.level + \" \" + .time + \" \" + .msg'</p>\n", t.logfile())
 	fmt.Fprintf(w, "<pre>")
 	h.logs(w, r, t, 0)
 	fmt.Fprintf(w, "</pre>")
@@ -631,27 +623,48 @@ func (h *handler) logs(w http.ResponseWriter, r *http.Request, t *task, offset i
 		return
 	}
 
-	f, err := os.Open(t.logfile(t.arch))
-	if err != nil {
-		log.Printf("opening file failed: %v", err)
-		return
-	}
-	defer f.Close()
-
-	if offset != 0 {
-		if _, err := f.Seek(offset, io.SeekStart); err != nil {
-			log.Printf("seeking file failed: %v", err)
+	if logfile := t.logfile(); logfile != "" {
+		f, err := os.Open(logfile)
+		if err != nil {
+			log.Printf("opening file failed: %v", err)
 			return
 		}
-	}
+		defer f.Close()
 
-	copied, err := io.Copy(w, f)
-	if err != nil {
-		log.Printf("copying err: %v", err)
+		if offset != 0 {
+			if _, err := f.Seek(offset, io.SeekStart); err != nil {
+				log.Printf("seeking file failed: %v", err)
+				return
+			}
+		}
+
+		type line struct {
+			Time  time.Time
+			Level string
+			Msg   string
+		}
+
+		dec := json.NewDecoder(f)
+		l := line{}
+		for {
+			if err := dec.Decode(&l); err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+
+				log.Printf("parsing json failed: %v", err)
+				return
+			}
+
+			ts := l.Time.Format("15:04:05.000")
+			fmt.Fprintf(w, "%s %s %s\n", l.Level[0:1], ts, l.Msg)
+		}
+
+		offset += dec.InputOffset()
 	}
 	if !t.done {
-		href := fmt.Sprintf("/logs?pkg=%s&arch=%s&offset=%d", t.pkg, t.arch, offset+copied)
-		fmt.Fprintf(w, `<div hx-get=%q hx-trigger="load delay:1s" hx-swap="outerHTML show:bottom"></div>`, href)
+		href := fmt.Sprintf("/logs?pkg=%s&arch=%s&offset=%d", t.pkg, t.arch, offset)
+		fmt.Fprintf(w, `<div id="load" hx-get=%q hx-trigger="load delay:1s" hx-swap="outerHTML show:bottom"></div>`, href)
 	}
 }
 
@@ -794,6 +807,10 @@ ul:nth-of-type(4) > li > a {
   display: table-cell;
   width: 33%;
   padding-bottom: 10px;
+}
+
+p {
+  font-family: monospace;
 }
 
 @keyframes pending {
