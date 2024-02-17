@@ -306,6 +306,37 @@ func (t *task) start(ctx context.Context) {
 		dep.maybeStart(ctx)
 	}
 
+	// We do this early because we need this info for t.logfile().
+	cfg, err := config.ParseConfiguration(ctx, fmt.Sprintf("%s.yaml", t.pkg), config.WithFS(os.DirFS(t.dir)))
+	if err != nil {
+		t.err = fmt.Errorf("failed to parse config: %w", err)
+		return
+	}
+	t.cfg = cfg
+
+	arch := types.ParseArchitecture(t.arch).ToAPK()
+
+	// See if we already have the package built.
+	apk := fmt.Sprintf("%s-%s-r%d.apk", t.cfg.Package.Name, t.cfg.Package.Version, t.cfg.Package.Epoch)
+	apkPath := filepath.Join(t.dir, "packages", arch, apk)
+	if _, err := os.Stat(apkPath); err == nil {
+		clog.FromContext(ctx).Infof("skipping %s, already built", apkPath)
+		t.status = "skipped"
+		return
+	}
+	if t.dryrun {
+		clog.FromContext(ctx).Infof("DRYRUN: would have built %s", apkPath)
+		t.status = "dryrun"
+		return
+	}
+
+	f, err := os.Create(t.logfile())
+	if err != nil {
+		t.err = fmt.Errorf("creating logfile: :%w", err)
+		return
+	}
+	defer f.Close()
+
 	if len(t.deps) != 0 {
 		clog.FromContext(ctx).Infof("task %q waiting on %q", t.pkg, maps.Keys(t.deps))
 	}
@@ -328,13 +359,10 @@ func (t *task) start(ctx context.Context) {
 	t.status = "running"
 
 	// all deps are done and we're clear to launch.
-	t.err = t.build(ctx)
+	t.err = t.build(ctx, f)
 }
 
-func (t *task) build(ctx context.Context) error {
-	log := clog.New(clog.FromContext(ctx).Handler()).With("pkg", t.pkg)
-	ctx = clog.WithLogger(ctx, log)
-
+func (t *task) build(ctx context.Context, f io.Writer) error {
 	if err := ctx.Err(); err != nil {
 		_, span := otel.Tracer("wolfictl").Start(ctx, "build "+t.pkg+" (canceled)")
 		defer span.End()
@@ -344,30 +372,9 @@ func (t *task) build(ctx context.Context) error {
 	ctx, span := otel.Tracer("wolfictl").Start(ctx, "build "+t.pkg)
 	defer span.End()
 
-	cfg, err := config.ParseConfiguration(ctx, fmt.Sprintf("%s.yaml", t.pkg), config.WithFS(os.DirFS(t.dir)))
-	if err != nil {
-		return fmt.Errorf("failed to parse config: %w", err)
-	}
-	t.cfg = cfg
-
 	arch := types.ParseArchitecture(t.arch).ToAPK()
 
-	// See if we already have the package built.
-	apk := fmt.Sprintf("%s-%s-r%d.apk", cfg.Package.Name, cfg.Package.Version, cfg.Package.Epoch)
-	apkPath := filepath.Join(t.dir, "packages", arch, apk)
-	if _, err := os.Stat(apkPath); err == nil {
-		log.Infof("skipping %s, already built", apkPath)
-		t.status = "skipped"
-		return nil
-	}
-
-	f, err := os.Create(t.logfile())
-	if err != nil {
-		return fmt.Errorf("creating logfile: :%w", err)
-	}
-	defer f.Close()
-
-	log = clog.New(slog.NewJSONHandler(f, nil)).With("pkg", t.pkg)
+	log := clog.New(slog.NewJSONHandler(f, nil)).With("pkg", t.pkg)
 	fctx := clog.WithLogger(ctx, log)
 
 	sdir := filepath.Join(t.dir, t.pkg)
@@ -380,18 +387,12 @@ func (t *task) build(ctx context.Context) error {
 	}
 
 	fn := fmt.Sprintf("%s.yaml", t.pkg)
-	if t.dryrun {
-		log.Infof("DRYRUN: would have built %s", apkPath)
-		t.status = "dryrun"
-		return nil
-	}
 
 	runner, err := newRunner(fctx, t.runner)
 	if err != nil {
 		return fmt.Errorf("creating runner: %w", err)
 	}
 
-	log.Infof("will build: %s", apkPath)
 	bc, err := build.New(fctx,
 		build.WithArch(types.ParseArchitecture(arch)),
 		build.WithConfig(filepath.Join(t.dir, fn)),
