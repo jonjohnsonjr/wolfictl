@@ -344,94 +344,99 @@ func (t *task) build(ctx context.Context) error {
 	}
 	t.cfg = cfg
 
+	var eg errgroup.Group
 	for _, arch := range t.archs {
 		arch := types.ParseArchitecture(arch).ToAPK()
 
-		pkgver := fmt.Sprintf("%s-%s-r%d", cfg.Package.Name, cfg.Package.Version, cfg.Package.Epoch)
-		logDir := logdir(t.dir, arch)
-		logfile := filepath.Join(logDir, pkgver) + ".log"
+		eg.Go(func() error {
+			pkgver := fmt.Sprintf("%s-%s-r%d", cfg.Package.Name, cfg.Package.Version, cfg.Package.Epoch)
+			logDir := logdir(t.dir, arch)
+			logfile := filepath.Join(logDir, pkgver) + ".log"
 
-		// See if we already have the package built.
-		apk := pkgver + ".apk"
-		apkPath := filepath.Join(t.dir, "packages", arch, apk)
-		if _, err := os.Stat(apkPath); err == nil {
-			log.Infof("skipping %s, already built", apkPath)
-			continue
-		}
-
-		f, err := os.Create(logfile)
-		if err != nil {
-			return fmt.Errorf("creating logfile: :%w", err)
-		}
-		defer f.Close()
-
-		log := clog.New(slog.NewTextHandler(f, nil)).With("pkg", t.pkg)
-		fctx := clog.WithLogger(ctx, log)
-
-		if len(t.archs) > 1 {
-			log = clog.New(log.Handler()).With("arch", arch)
-			fctx = clog.WithLogger(fctx, log)
-		}
-
-		sdir := filepath.Join(t.dir, t.pkg)
-		if _, err := os.Stat(sdir); os.IsNotExist(err) {
-			if err := os.MkdirAll(sdir, os.ModePerm); err != nil {
-				return fmt.Errorf("creating source directory %s: %v", sdir, err)
-			}
-		} else if err != nil {
-			return fmt.Errorf("creating source directory: %v", err)
-		}
-
-		fn := fmt.Sprintf("%s.yaml", t.pkg)
-		if t.dryrun {
-			log.Infof("DRYRUN: would have built %s", apkPath)
-			continue
-		}
-
-		runner, err := newRunner(fctx, t.runner)
-		if err != nil {
-			return fmt.Errorf("creating runner: %w", err)
-		}
-
-		log.Infof("will build: %s", apkPath)
-		bc, err := build.New(fctx,
-			build.WithArch(types.ParseArchitecture(arch)),
-			build.WithConfig(filepath.Join(t.dir, fn)),
-			build.WithPipelineDir(t.pipelineDir),
-			build.WithExtraKeys([]string{"https://packages.wolfi.dev/os/wolfi-signing.rsa.pub"}), // TODO: flag
-			build.WithExtraRepos([]string{"https://packages.wolfi.dev/os"}),                      // TODO: flag
-			build.WithSigningKey(filepath.Join(t.dir, "local-melange.rsa")),
-			build.WithRunner(runner),
-			build.WithEnvFile(filepath.Join(t.dir, fmt.Sprintf("build-%s.env", arch))),
-			build.WithNamespace("wolfi"), // TODO: flag
-			build.WithSourceDir(sdir),
-			// build.WithCacheSource("gs://wolfi-sources/"), // TODO: flag
-			// build.WithCacheDir("./melange-cache/"),       // TODO: flag
-			build.WithOutDir(filepath.Join(t.dir, "packages")),
-			build.WithRemove(t.remove),
-		)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			// We Close() with the original context if we're cancelled so we get cleanup logs to stderr.
-			ctx := ctx
-			if ctx.Err() == nil {
-				// On happy path, we don't care about cleanup logs.
-				ctx = fctx
+			// See if we already have the package built.
+			apk := pkgver + ".apk"
+			apkPath := filepath.Join(t.dir, "packages", arch, apk)
+			if _, err := os.Stat(apkPath); err == nil {
+				log.Infof("skipping %s, already built", apkPath)
+				return nil
 			}
 
-			if err := bc.Close(ctx); err != nil {
-				log.Errorf("closing build %q: %v", t.pkg, err)
+			f, err := os.Create(logfile)
+			if err != nil {
+				return fmt.Errorf("creating logfile: :%w", err)
 			}
-		}()
+			defer f.Close()
 
-		if err := bc.BuildPackage(fctx); err != nil {
-			return fmt.Errorf("building package (see %q for logs): %w", logfile, err)
-		}
+			log := clog.New(slog.NewTextHandler(f, nil)).With("pkg", t.pkg)
+			fctx := clog.WithLogger(ctx, log)
+
+			if len(t.archs) > 1 {
+				log = clog.New(log.Handler()).With("arch", arch)
+				fctx = clog.WithLogger(fctx, log)
+			}
+
+			sdir := filepath.Join(t.dir, t.pkg)
+			if _, err := os.Stat(sdir); os.IsNotExist(err) {
+				if err := os.MkdirAll(sdir, os.ModePerm); err != nil {
+					return fmt.Errorf("creating source directory %s: %v", sdir, err)
+				}
+			} else if err != nil {
+				return fmt.Errorf("creating source directory: %v", err)
+			}
+
+			fn := fmt.Sprintf("%s.yaml", t.pkg)
+			if t.dryrun {
+				log.Infof("DRYRUN: would have built %s", apkPath)
+				return nil
+			}
+
+			runner, err := newRunner(fctx, t.runner)
+			if err != nil {
+				return fmt.Errorf("creating runner: %w", err)
+			}
+
+			log.Infof("will build: %s", apkPath)
+			bc, err := build.New(fctx,
+				build.WithArch(types.ParseArchitecture(arch)),
+				build.WithConfig(filepath.Join(t.dir, fn)),
+				build.WithPipelineDir(t.pipelineDir),
+				build.WithExtraKeys([]string{"https://packages.wolfi.dev/os/wolfi-signing.rsa.pub"}), // TODO: flag
+				build.WithExtraRepos([]string{"https://packages.wolfi.dev/os"}),                      // TODO: flag
+				build.WithSigningKey(filepath.Join(t.dir, "local-melange.rsa")),
+				build.WithRunner(runner),
+				build.WithEnvFile(filepath.Join(t.dir, fmt.Sprintf("build-%s.env", arch))),
+				build.WithNamespace("wolfi"), // TODO: flag
+				build.WithSourceDir(sdir),
+				// build.WithCacheSource("gs://wolfi-sources/"), // TODO: flag
+				// build.WithCacheDir("./melange-cache/"),       // TODO: flag
+				build.WithOutDir(filepath.Join(t.dir, "packages")),
+				build.WithRemove(t.remove),
+			)
+			if err != nil {
+				return err
+			}
+			defer func() {
+				// We Close() with the original context if we're cancelled so we get cleanup logs to stderr.
+				ctx := ctx
+				if ctx.Err() == nil {
+					// On happy path, we don't care about cleanup logs.
+					ctx = fctx
+				}
+
+				if err := bc.Close(ctx); err != nil {
+					log.Errorf("closing build %q: %v", t.pkg, err)
+				}
+			}()
+
+			if err := bc.BuildPackage(fctx); err != nil {
+				return fmt.Errorf("building package (see %q for logs): %w", logfile, err)
+			}
+
+			return nil
+		})
 	}
 
-	return nil
+	return eg.Wait()
 }
 
 func (t *task) logfile(arch string) string {
@@ -569,10 +574,31 @@ func (h *handler) pkgFragment(w http.ResponseWriter, r *http.Request, pkg string
 		fmt.Fprintf(w, "</ul>\n")
 	}
 
+	if len(t.archs) == 0 {
+		return
+	}
+
+	arch := r.URL.Query().Get("arch")
+	if len(t.archs) == 1 {
+		arch = t.archs[0]
+	}
+
 	fmt.Fprintln(w, "<h2>logs</h2>")
-	fmt.Fprintf(w, "<pre>")
-	h.logs(w, r, t, 0)
-	fmt.Fprintf(w, "</pre>")
+	fmt.Fprintln(w, "<ul>")
+	for _, a := range t.archs {
+		if a == arch {
+			fmt.Fprintf(w, "\t<li>%s</li>\n", a)
+		} else {
+			fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s&arch=%s\">%s</a></li>\n", pkg, a, a)
+		}
+	}
+	fmt.Fprintf(w, "</ul>\n")
+
+	if arch != "" {
+		fmt.Fprintf(w, "<pre>")
+		h.logs(w, r, t, arch, 0)
+		fmt.Fprintf(w, "</pre>")
+	}
 }
 
 func (h *handler) logFragment(w http.ResponseWriter, r *http.Request) {
@@ -601,16 +627,16 @@ func (h *handler) logFragment(w http.ResponseWriter, r *http.Request) {
 		panic(err)
 	}
 
-	h.logs(w, r, t, int64(offset))
+	h.logs(w, r, t, r.URL.Query().Get("arch"), int64(offset))
 }
 
-func (h *handler) logs(w http.ResponseWriter, r *http.Request, t *task, offset int64) {
+func (h *handler) logs(w http.ResponseWriter, r *http.Request, t *task, arch string, offset int64) {
 	if !t.started {
 		return
 	}
 
 	// TODO: Handle arch.
-	f, err := os.Open(t.logfile("aarch64"))
+	f, err := os.Open(t.logfile(arch))
 	if err != nil {
 		log.Printf("opening file failed: %v", err)
 		return
@@ -629,7 +655,7 @@ func (h *handler) logs(w http.ResponseWriter, r *http.Request, t *task, offset i
 		log.Printf("copying err: %v", err)
 	}
 	if !t.done {
-		href := fmt.Sprintf("/logs?pkg=%s&offset=%d", t.pkg, offset+copied)
+		href := fmt.Sprintf("/logs?pkg=%s&arch=%s&offset=%d", t.pkg, arch, offset+copied)
 		fmt.Fprintf(w, `<div hx-get=%q hx-trigger="load delay:1s" hx-swap="outerHTML show:bottom"></div>`, href)
 	}
 }
@@ -679,9 +705,9 @@ body {
   color-scheme: dark;
   background: black;
   color: white;
-  padding-left: 10%;
-  padding-right: 10%;
-  padding-top: 100px;
+  padding-left: 5%;
+  padding-right: 5%;
+  padding-top: 40px;
   font-family: "Helvetica Neue", "Arial";
 }
 
@@ -704,7 +730,7 @@ pre {
 
 h1 {
   text-align: center;
-  margin-bottom: 80px;
+  margin-bottom: 40px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -720,7 +746,7 @@ ul {
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   list-style-type: none;
   padding-left: 0;
-  padding-bottom: 50px;
+  padding-bottom: 20px;
   row-gap: 10px;
   column-gap: 40px;
 }
@@ -756,7 +782,7 @@ ul:nth-of-type(4) > li > a {
     opacity: 1;
   }
   50% {
-    opacity: 0.7;
+    opacity: 0.8;
   }
   100% {
     opacity: 1;
