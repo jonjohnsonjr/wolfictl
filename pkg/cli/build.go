@@ -90,7 +90,11 @@ func cmdBuild() *cobra.Command {
 			var h *handler
 			if web {
 				h = &handler{
-					tasks: map[string]*task{},
+					tasks: map[string]map[string]*task{},
+					archs: archs,
+				}
+				for _, arch := range archs {
+					h.tasks[arch] = map[string]*task{}
 				}
 			}
 
@@ -100,152 +104,155 @@ func cmdBuild() *cobra.Command {
 				if err := os.MkdirAll(archDir, os.ModePerm); err != nil {
 					return fmt.Errorf("creating buildlogs directory: %w", err)
 				}
-			}
 
-			newTask := func(pkg string) *task {
-				return &task{
-					pkg:         pkg,
-					dir:         dir,
-					pipelineDir: pipelineDir,
-					runner:      runner,
-					archs:       archs,
-					dryrun:      dryrun,
-					remove:      remove,
-					jobch:       jobch,
-					cond:        sync.NewCond(&sync.Mutex{}),
-					deps:        map[string]*task{},
-					h:           h,
-				}
-			}
-
-			// We want to ignore info level here during setup, but further down below we pull whatever was passed to use via ctx.
-			log := clog.New(charmlog.NewWithOptions(os.Stderr, charmlog.Options{ReportTimestamp: true, Level: charmlog.Level(charmlog.WarnLevel)}))
-			setupCtx := clog.WithLogger(ctx, log)
-			pkgs, err := dag.NewPackages(setupCtx, os.DirFS(dir), dir, pipelineDir)
-			if err != nil {
-				return err
-			}
-			g, err := dag.NewGraph(setupCtx, pkgs,
-				dag.WithKeys(extraKeys...),
-				dag.WithRepos(extraRepos...))
-			if err != nil {
-				return err
-			}
-
-			// Only return local packages
-			g, err = g.Filter(dag.FilterLocal())
-			if err != nil {
-				return err
-			}
-
-			// Only return main packages (configs)
-			g, err = g.Filter(dag.OnlyMainPackages(pkgs))
-			if err != nil {
-				return err
-			}
-
-			m, err := g.Graph.AdjacencyMap()
-			if err != nil {
-				return err
-			}
-
-			// Back to normal logger.
-			log = clog.FromContext(ctx)
-
-			tasks := map[string]*task{}
-			for _, pkg := range g.Packages() {
-				if tasks[pkg] == nil {
-					tasks[pkg] = newTask(pkg)
-				}
-				for k, v := range m {
-					// The package list is in the form of "pkg:version",
-					// but we only care about the package name.
-					if strings.HasPrefix(k, pkg+":") {
-						for _, dep := range v {
-							d, _, _ := strings.Cut(dep.Target, ":")
-
-							if tasks[d] == nil {
-								tasks[d] = newTask(d)
-							}
-							tasks[pkg].deps[d] = tasks[d]
-						}
+				newTask := func(pkg string) *task {
+					return &task{
+						pkg:         pkg,
+						dir:         dir,
+						pipelineDir: pipelineDir,
+						runner:      runner,
+						arch:        arch,
+						dryrun:      dryrun,
+						remove:      remove,
+						jobch:       jobch,
+						cond:        sync.NewCond(&sync.Mutex{}),
+						deps:        map[string]*task{},
+						h:           h,
 					}
 				}
-			}
 
-			if len(tasks) == 0 {
-				return fmt.Errorf("no packages to build")
-			}
-
-			todos := tasks
-			if len(args) != 0 {
-				todos = make(map[string]*task, len(args))
-
-				for _, arg := range args {
-					todos[arg] = tasks[arg]
+				// We want to ignore info level here during setup, but further down below we pull whatever was passed to use via ctx.
+				log := clog.New(charmlog.NewWithOptions(os.Stderr, charmlog.Options{ReportTimestamp: true, Level: charmlog.Level(charmlog.WarnLevel)}))
+				setupCtx := clog.WithLogger(ctx, log)
+				pkgs, err := dag.NewPackages(setupCtx, os.DirFS(dir), dir, pipelineDir)
+				if err != nil {
+					return err
 				}
-			}
-
-			for _, t := range todos {
-				t.maybeStart(ctx)
-			}
-			count := len(todos)
-
-			var eg errgroup.Group
-
-			if web {
-				http.Handle("/", h)
-
-				l, err := net.Listen("tcp", "127.0.0.1:0")
+				g, err := dag.NewGraph(setupCtx, pkgs,
+					dag.WithKeys(extraKeys...),
+					dag.WithRepos(extraRepos...))
 				if err != nil {
 					return err
 				}
 
-				server := &http.Server{
-					Addr:              l.Addr().String(),
-					ReadHeaderTimeout: 3 * time.Second,
+				// Only return local packages
+				g, err = g.Filter(dag.FilterLocal())
+				if err != nil {
+					return err
 				}
 
-				log.Infof("%s", l.Addr().String())
+				// Only return main packages (configs)
+				g, err = g.Filter(dag.OnlyMainPackages(pkgs))
+				if err != nil {
+					return err
+				}
 
-				eg.Go(func() error {
-					server.Serve(l)
-					return nil
-				})
+				m, err := g.Graph.AdjacencyMap()
+				if err != nil {
+					return err
+				}
 
-				eg.Go(func() error {
-					open.Run(fmt.Sprintf("http://localhost:%d", l.Addr().(*net.TCPAddr).Port))
-					return nil
-				})
+				// Back to normal logger.
+				log = clog.FromContext(ctx)
 
-				eg.Go(func() error {
-					<-ctx.Done()
-					server.Close()
-					return nil
-				})
-			}
+				tasks := map[string]*task{}
+				for _, pkg := range g.Packages() {
+					if tasks[pkg] == nil {
+						tasks[pkg] = newTask(pkg)
+					}
+					for k, v := range m {
+						// The package list is in the form of "pkg:version",
+						// but we only care about the package name.
+						if strings.HasPrefix(k, pkg+":") {
+							for _, dep := range v {
+								d, _, _ := strings.Cut(dep.Target, ":")
 
-			eg.Go(func() error {
-				errs := []error{}
+								if tasks[d] == nil {
+									tasks[d] = newTask(d)
+								}
+								tasks[pkg].deps[d] = tasks[d]
+							}
+						}
+					}
+				}
+
+				if len(tasks) == 0 {
+					return fmt.Errorf("no packages to build")
+				}
+
+				todos := tasks
+				if len(args) != 0 {
+					todos = make(map[string]*task, len(args))
+
+					for _, arg := range args {
+						todos[arg] = tasks[arg]
+					}
+				}
+
 				for _, t := range todos {
-					if err := t.wait(); err != nil {
-						errs = append(errs, fmt.Errorf("failed to build %s: %w", t.pkg, err))
-						continue
+					t.maybeStart(ctx)
+				}
+				count := len(todos)
+
+				var eg errgroup.Group
+
+				if web {
+					http.Handle("/", h)
+
+					l, err := net.Listen("tcp", "127.0.0.1:0")
+					if err != nil {
+						return err
 					}
 
-					delete(tasks, t.pkg)
-					log.Infof("Finished building %s (%d/%d)", t.pkg, count-len(tasks), count)
+					server := &http.Server{
+						Addr:              l.Addr().String(),
+						ReadHeaderTimeout: 3 * time.Second,
+					}
+
+					log.Infof("%s", l.Addr().String())
+
+					eg.Go(func() error {
+						server.Serve(l)
+						return nil
+					})
+
+					eg.Go(func() error {
+						open.Run(fmt.Sprintf("http://localhost:%d", l.Addr().(*net.TCPAddr).Port))
+						return nil
+					})
+
+					eg.Go(func() error {
+						<-ctx.Done()
+						server.Close()
+						return nil
+					})
 				}
 
-				// If the context is cancelled, it's not useful to print everything, just summarize the count.
-				if err := ctx.Err(); err != nil {
-					return fmt.Errorf("failed to build %d packages: %w", len(errs), err)
-				}
+				eg.Go(func() error {
+					errs := []error{}
+					for _, t := range todos {
+						if err := t.wait(); err != nil {
+							errs = append(errs, fmt.Errorf("failed to build %s: %w", t.pkg, err))
+							continue
+						}
 
-				return errors.Join(errs...)
-			})
+						delete(tasks, t.pkg)
+						log.Infof("Finished building %s (%d/%d)", t.pkg, count-len(tasks), count)
+					}
 
-			return eg.Wait()
+					// If the context is cancelled, it's not useful to print everything, just summarize the count.
+					if err := ctx.Err(); err != nil {
+						return fmt.Errorf("failed to build %d packages: %w", len(errs), err)
+					}
+
+					return errors.Join(errs...)
+				})
+
+				return eg.Wait()
+			}
+
+			// TODO: eg.wait
+			return nil
 		},
 	}
 
@@ -266,7 +273,7 @@ func cmdBuild() *cobra.Command {
 type task struct {
 	pkg, dir, pipelineDir, runner string
 
-	archs  []string
+	arch   string
 	dryrun bool
 	remove bool
 
@@ -326,7 +333,7 @@ func (t *task) start(ctx context.Context) {
 }
 
 func (t *task) build(ctx context.Context) error {
-	log := clog.New(clog.FromContext(ctx).Handler()).With("package", t.pkg)
+	log := clog.New(clog.FromContext(ctx).Handler()).With("pkg", t.pkg)
 	ctx = clog.WithLogger(ctx, log)
 
 	if err := ctx.Err(); err != nil {
@@ -344,99 +351,95 @@ func (t *task) build(ctx context.Context) error {
 	}
 	t.cfg = cfg
 
-	var eg errgroup.Group
-	for _, arch := range t.archs {
-		arch := types.ParseArchitecture(arch).ToAPK()
+	arch := types.ParseArchitecture(t.arch).ToAPK()
 
-		eg.Go(func() error {
-			pkgver := fmt.Sprintf("%s-%s-r%d", cfg.Package.Name, cfg.Package.Version, cfg.Package.Epoch)
-			logDir := logdir(t.dir, arch)
-			logfile := filepath.Join(logDir, pkgver) + ".log"
+	pkgver := fmt.Sprintf("%s-%s-r%d", cfg.Package.Name, cfg.Package.Version, cfg.Package.Epoch)
+	logDir := logdir(t.dir, arch)
+	logfile := filepath.Join(logDir, pkgver) + ".log"
 
-			// See if we already have the package built.
-			apk := pkgver + ".apk"
-			apkPath := filepath.Join(t.dir, "packages", arch, apk)
-			if _, err := os.Stat(apkPath); err == nil {
-				log.Infof("skipping %s, already built", apkPath)
-				return nil
-			}
-
-			f, err := os.Create(logfile)
-			if err != nil {
-				return fmt.Errorf("creating logfile: :%w", err)
-			}
-			defer f.Close()
-
-			log := clog.New(slog.NewTextHandler(f, nil)).With("pkg", t.pkg)
-			fctx := clog.WithLogger(ctx, log)
-
-			if len(t.archs) > 1 {
-				log = clog.New(log.Handler()).With("arch", arch)
-				fctx = clog.WithLogger(fctx, log)
-			}
-
-			sdir := filepath.Join(t.dir, t.pkg)
-			if _, err := os.Stat(sdir); os.IsNotExist(err) {
-				if err := os.MkdirAll(sdir, os.ModePerm); err != nil {
-					return fmt.Errorf("creating source directory %s: %v", sdir, err)
-				}
-			} else if err != nil {
-				return fmt.Errorf("creating source directory: %v", err)
-			}
-
-			fn := fmt.Sprintf("%s.yaml", t.pkg)
-			if t.dryrun {
-				log.Infof("DRYRUN: would have built %s", apkPath)
-				return nil
-			}
-
-			runner, err := newRunner(fctx, t.runner)
-			if err != nil {
-				return fmt.Errorf("creating runner: %w", err)
-			}
-
-			log.Infof("will build: %s", apkPath)
-			bc, err := build.New(fctx,
-				build.WithArch(types.ParseArchitecture(arch)),
-				build.WithConfig(filepath.Join(t.dir, fn)),
-				build.WithPipelineDir(t.pipelineDir),
-				build.WithExtraKeys([]string{"https://packages.wolfi.dev/os/wolfi-signing.rsa.pub"}), // TODO: flag
-				build.WithExtraRepos([]string{"https://packages.wolfi.dev/os"}),                      // TODO: flag
-				build.WithSigningKey(filepath.Join(t.dir, "local-melange.rsa")),
-				build.WithRunner(runner),
-				build.WithEnvFile(filepath.Join(t.dir, fmt.Sprintf("build-%s.env", arch))),
-				build.WithNamespace("wolfi"), // TODO: flag
-				build.WithSourceDir(sdir),
-				// build.WithCacheSource("gs://wolfi-sources/"), // TODO: flag
-				// build.WithCacheDir("./melange-cache/"),       // TODO: flag
-				build.WithOutDir(filepath.Join(t.dir, "packages")),
-				build.WithRemove(t.remove),
-			)
-			if err != nil {
-				return err
-			}
-			defer func() {
-				// We Close() with the original context if we're cancelled so we get cleanup logs to stderr.
-				ctx := ctx
-				if ctx.Err() == nil {
-					// On happy path, we don't care about cleanup logs.
-					ctx = fctx
-				}
-
-				if err := bc.Close(ctx); err != nil {
-					log.Errorf("closing build %q: %v", t.pkg, err)
-				}
-			}()
-
-			if err := bc.BuildPackage(fctx); err != nil {
-				return fmt.Errorf("building package (see %q for logs): %w", logfile, err)
-			}
-
-			return nil
-		})
+	// See if we already have the package built.
+	apk := pkgver + ".apk"
+	apkPath := filepath.Join(t.dir, "packages", arch, apk)
+	if _, err := os.Stat(apkPath); err == nil {
+		log.Infof("skipping %s, already built", apkPath)
+		t.status = "skipped"
+		return nil
 	}
 
-	return eg.Wait()
+	f, err := os.Create(logfile)
+	if err != nil {
+		return fmt.Errorf("creating logfile: :%w", err)
+	}
+	defer f.Close()
+
+	log = clog.New(slog.NewTextHandler(f, nil)).With("pkg", t.pkg)
+	fctx := clog.WithLogger(ctx, log)
+
+	// TODO ?
+	// if len(t.archs) > 1 {
+	// 	log = clog.New(log.Handler()).With("arch", arch)
+	// 	fctx = clog.WithLogger(fctx, log)
+	// }
+
+	sdir := filepath.Join(t.dir, t.pkg)
+	if _, err := os.Stat(sdir); os.IsNotExist(err) {
+		if err := os.MkdirAll(sdir, os.ModePerm); err != nil {
+			return fmt.Errorf("creating source directory %s: %v", sdir, err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("creating source directory: %v", err)
+	}
+
+	fn := fmt.Sprintf("%s.yaml", t.pkg)
+	if t.dryrun {
+		log.Infof("DRYRUN: would have built %s", apkPath)
+		t.status = "dryrun"
+		return nil
+	}
+
+	runner, err := newRunner(fctx, t.runner)
+	if err != nil {
+		return fmt.Errorf("creating runner: %w", err)
+	}
+
+	log.Infof("will build: %s", apkPath)
+	bc, err := build.New(fctx,
+		build.WithArch(types.ParseArchitecture(arch)),
+		build.WithConfig(filepath.Join(t.dir, fn)),
+		build.WithPipelineDir(t.pipelineDir),
+		build.WithExtraKeys([]string{"https://packages.wolfi.dev/os/wolfi-signing.rsa.pub"}), // TODO: flag
+		build.WithExtraRepos([]string{"https://packages.wolfi.dev/os"}),                      // TODO: flag
+		build.WithSigningKey(filepath.Join(t.dir, "local-melange.rsa")),
+		build.WithRunner(runner),
+		build.WithEnvFile(filepath.Join(t.dir, fmt.Sprintf("build-%s.env", arch))),
+		build.WithNamespace("wolfi"), // TODO: flag
+		build.WithSourceDir(sdir),
+		// build.WithCacheSource("gs://wolfi-sources/"), // TODO: flag
+		// build.WithCacheDir("./melange-cache/"),       // TODO: flag
+		build.WithOutDir(filepath.Join(t.dir, "packages")),
+		build.WithRemove(t.remove),
+	)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// We Close() with the original context if we're cancelled so we get cleanup logs to stderr.
+		ctx := ctx
+		if ctx.Err() == nil {
+			// On happy path, we don't care about cleanup logs.
+			ctx = fctx
+		}
+
+		if err := bc.Close(ctx); err != nil {
+			log.Errorf("closing build %q: %v", t.pkg, err)
+		}
+	}()
+
+	if err := bc.BuildPackage(fctx); err != nil {
+		return fmt.Errorf("building package (see %q for logs): %w", logfile, err)
+	}
+
+	return nil
 }
 
 func (t *task) logfile(arch string) string {
@@ -483,16 +486,21 @@ func logdir(dir, arch string) string {
 }
 
 type handler struct {
-	tasks map[string]*task
+	tasks map[string]map[string]*task
+	archs []string
 	sync.Mutex
 }
 
 func (h *handler) dashFragment(w http.ResponseWriter, r *http.Request) {
-	vals := maps.Values(h.tasks)
+	fmt.Fprintln(w, "<h1>wolfictl build</h1>")
+	arch := h.arch(w, r)
+	if arch == "" {
+		return
+	}
+	vals := maps.Values(h.tasks[arch])
 	slices.SortFunc(vals, func(a, b *task) int {
 		return strings.Compare(a.pkg, b.pkg)
 	})
-	fmt.Fprintln(w, "<h1>wolfictl build</h1>")
 
 	running := []*task{}
 	failed := []*task{}
@@ -560,11 +568,18 @@ func (h *handler) dashFragment(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) pkgFragment(w http.ResponseWriter, r *http.Request, pkg string) {
-	t, ok := h.tasks[pkg]
+	fmt.Fprintf(w, "<h1>%s</h1>\n", pkg)
+
+	arch := h.arch(w, r)
+	if arch == "" {
+		return
+	}
+
+	t, ok := h.tasks[arch][pkg]
 	if !ok {
 		panic(pkg)
 	}
-	fmt.Fprintf(w, "<h1>%s: %s</h1>\n", pkg, t.status)
+
 	if len(t.deps) != 0 {
 		fmt.Fprintln(w, "<h2>deps</h2>")
 		fmt.Fprintln(w, "<ul>")
@@ -574,40 +589,20 @@ func (h *handler) pkgFragment(w http.ResponseWriter, r *http.Request, pkg string
 		fmt.Fprintf(w, "</ul>\n")
 	}
 
-	if len(t.archs) == 0 {
-		return
-	}
-
-	arch := r.URL.Query().Get("arch")
-	if len(t.archs) == 1 {
-		arch = t.archs[0]
-	}
-
 	fmt.Fprintln(w, "<h2>logs</h2>")
-	fmt.Fprintln(w, "<ul>")
-	for _, a := range t.archs {
-		if a == arch {
-			fmt.Fprintf(w, "\t<li>%s</li>\n", a)
-		} else {
-			fmt.Fprintf(w, "\t<li><a href=\"/?pkg=%s&arch=%s\">%s</a></li>\n", pkg, a, a)
-		}
-	}
-	fmt.Fprintf(w, "</ul>\n")
-
-	if arch != "" {
-		fmt.Fprintf(w, "<pre>")
-		h.logs(w, r, t, arch, 0)
-		fmt.Fprintf(w, "</pre>")
-	}
+	fmt.Fprintf(w, "<pre>")
+	h.logs(w, r, t, 0)
+	fmt.Fprintf(w, "</pre>")
 }
 
 func (h *handler) logFragment(w http.ResponseWriter, r *http.Request) {
+	arch := r.URL.Query().Get("arch")
 	pkg := r.URL.Query().Get("pkg")
 	if pkg == "" {
 		panic("missing pkg")
 	}
 
-	t, ok := h.tasks[pkg]
+	t, ok := h.tasks[arch][pkg]
 	if !ok {
 		panic(pkg)
 	}
@@ -627,16 +622,15 @@ func (h *handler) logFragment(w http.ResponseWriter, r *http.Request) {
 		panic(err)
 	}
 
-	h.logs(w, r, t, r.URL.Query().Get("arch"), int64(offset))
+	h.logs(w, r, t, int64(offset))
 }
 
-func (h *handler) logs(w http.ResponseWriter, r *http.Request, t *task, arch string, offset int64) {
+func (h *handler) logs(w http.ResponseWriter, r *http.Request, t *task, offset int64) {
 	if !t.started {
 		return
 	}
 
-	// TODO: Handle arch.
-	f, err := os.Open(t.logfile(arch))
+	f, err := os.Open(t.logfile(t.arch))
 	if err != nil {
 		log.Printf("opening file failed: %v", err)
 		return
@@ -655,9 +649,28 @@ func (h *handler) logs(w http.ResponseWriter, r *http.Request, t *task, arch str
 		log.Printf("copying err: %v", err)
 	}
 	if !t.done {
-		href := fmt.Sprintf("/logs?pkg=%s&arch=%s&offset=%d", t.pkg, arch, offset+copied)
+		href := fmt.Sprintf("/logs?pkg=%s&arch=%s&offset=%d", t.pkg, t.arch, offset+copied)
 		fmt.Fprintf(w, `<div hx-get=%q hx-trigger="load delay:1s" hx-swap="outerHTML show:bottom"></div>`, href)
 	}
+}
+
+func (h *handler) arch(w http.ResponseWriter, r *http.Request) string {
+	arch := r.URL.Query().Get("arch")
+	if len(h.archs) == 1 {
+		arch = h.archs[0]
+	} else {
+		fmt.Fprintln(w, "<ul>")
+		for _, a := range h.archs {
+			if a == arch {
+				fmt.Fprintf(w, "\t<li>%s</li>\n", a)
+			} else {
+				fmt.Fprintf(w, "\t<li><a href=\"/&arch=%s\">%s</a></li>\n", a, a)
+			}
+		}
+		fmt.Fprintln(w, "</ul>")
+	}
+
+	return arch
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -697,7 +710,7 @@ func (h *handler) addTask(t *task) {
 	h.Lock()
 	defer h.Unlock()
 
-	h.tasks[t.pkg] = t
+	h.tasks[t.arch][t.pkg] = t
 }
 
 const style = `<style>
