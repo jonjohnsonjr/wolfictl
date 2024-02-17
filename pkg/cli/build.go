@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -664,7 +665,12 @@ func (h *handler) arch(w http.ResponseWriter, r *http.Request) string {
 			if a == arch {
 				fmt.Fprintf(w, "\t<li>%s</li>\n", a)
 			} else {
-				fmt.Fprintf(w, "\t<li><a href=\"/&arch=%s\">%s</a></li>\n", a, a)
+				// For lack of Clone().
+				u, _ := url.Parse(r.URL.String())
+				qs := u.Query()
+				qs.Set("arch", a)
+				u.RawQuery = qs.Encode()
+				fmt.Fprintf(w, "\t<li><a href=%q>%s</a></li>\n", u, a)
 			}
 		}
 		fmt.Fprintln(w, "</ul>")
