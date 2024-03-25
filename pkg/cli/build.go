@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -26,6 +28,13 @@ import (
 	"github.com/chainguard-dev/go-apk/pkg/apk"
 	charmlog "github.com/charmbracelet/log"
 	"github.com/dominikbraun/graph"
+	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/partial"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/spf13/cobra"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
@@ -40,7 +49,9 @@ func cmdBuild() *cobra.Command {
 	var jobs int
 	var traceFile string
 
-	cfg := global{}
+	cfg := global{
+		base: empty.Index,
+	}
 
 	// TODO: buildworld bool (build deps vs get them from package repo)
 	// TODO: builddownstream bool (build things that depend on listed packages)
@@ -90,6 +101,17 @@ func cmdBuild() *cobra.Command {
 				cfg.outDir = filepath.Join(cfg.dir, "packages")
 			}
 
+			if cfg.baseRef != "" {
+				ref, err := name.ParseReference(cfg.baseRef)
+				if err != nil {
+					return err
+				}
+				cfg.base, err = remote.Index(ref)
+				if err != nil {
+					return err
+				}
+			}
+
 			return buildAll(ctx, &cfg, args)
 		},
 	}
@@ -108,6 +130,8 @@ func cmdBuild() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.cacheSource, "cache-source", "", "directory or bucket used for preloading the cache")
 	cmd.Flags().BoolVar(&cfg.generateIndex, "generate-index", true, "whether to generate APKINDEX.tar.gz")
 	cmd.Flags().StringVar(&cfg.dst, "destination-repository", "", "repo where packages will eventually be uploaded, used to skip existing packages (currently only supports http)")
+	cmd.Flags().StringVar(&cfg.baseRef, "bundle-base", "", "base image used for melange build bundles")
+	cmd.Flags().StringVar(&cfg.repo, "bundle-repo", "", "where to push the bundles")
 
 	cmd.Flags().IntVarP(&jobs, "jobs", "j", 0, "number of jobs to run concurrently (default is GOMAXPROCS)")
 	cmd.Flags().StringVar(&traceFile, "trace", "", "where to write trace output")
@@ -375,6 +399,10 @@ type global struct {
 	cacheDir    string
 	outDir      string
 
+	baseRef string
+	base    v1.ImageIndex
+	repo    string
+
 	// arch -> foo.apk -> exists in APKINDEX
 	exists map[string]map[string]struct{}
 
@@ -595,6 +623,11 @@ func (t *task) buildArch(ctx context.Context, arch string) error {
 func (t *task) build(ctx context.Context) error {
 	log := clog.FromContext(ctx)
 
+	bundle, err := t.createBundle(t.cfg.base)
+	if err != nil {
+		return err
+	}
+
 	archs := t.filterArchs()
 
 	skipByArch := map[string]bool{}
@@ -743,4 +776,94 @@ func logs(fname string) error {
 	}
 	fmt.Printf("::endgroup::\n")
 	return nil
+}
+
+// TODO: I think this is probably wrong, actually.
+func (t *task) sourceDir() (string, error) {
+	sdir := filepath.Join(t.cfg.dir, t.pkg)
+	if _, err := os.Stat(sdir); os.IsNotExist(err) {
+		if err := os.MkdirAll(sdir, os.ModePerm); err != nil {
+			return "", fmt.Errorf("creating source directory %s: %v", sdir, err)
+		}
+	} else if err != nil {
+		return "", fmt.Errorf("creating source directory: %v", err)
+	}
+
+	return sdir, nil
+}
+
+// todo: optimize this if it matters (it probably doesn't)
+func (t *task) layer() (v1.Layer, error) {
+	sdir, err := t.sourceDir()
+	if err != nil {
+		return nil, err
+	}
+	dirfs := os.DirFS(sdir)
+
+	var buf bytes.Buffer
+
+	tw := tar.NewWriter(&buf)
+	if err := tw.AddFS(dirfs); err != nil {
+		return nil, err
+	}
+
+	if err := tw.Close(); err != nil {
+		return nil, err
+	}
+
+	opener := func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(buf.Bytes())), nil
+	}
+
+	return tarball.LayerFromOpener(opener)
+}
+
+func (t *task) createBundle(base v1.ImageIndex) (v1.ImageIndex, error) {
+	m, err := base.IndexManifest()
+	if err != nil {
+		return nil, err
+	}
+
+	wantArchs := map[string]struct{}{}
+	for _, arch := range t.cfg.archs {
+		wantArchs[types.ParseArchitecture(arch).ToAPK()] = struct{}{}
+	}
+
+	var idx v1.ImageIndex = empty.Index
+
+	for _, desc := range m.Manifests {
+		arch := types.ParseArchitecture(desc.Platform.Architecture).ToAPK()
+		if _, ok := wantArchs[arch]; !ok {
+			continue
+		}
+
+		baseImg, err := base.Image(desc.Digest)
+		if err != nil {
+			return nil, err
+		}
+
+		layer, err := t.layer()
+		if err != nil {
+			return nil, err
+		}
+
+		img, err := mutate.AppendLayers(baseImg, layer)
+		if err != nil {
+			return nil, err
+		}
+
+		newDesc, err := partial.Descriptor(img)
+		if err != nil {
+			return nil, err
+		}
+
+		newDesc.Platform = desc.Platform
+
+		idx = mutate.AppendManifests(idx, mutate.IndexAddendum{
+			Add:        img,
+			Descriptor: *newDesc,
+		})
+	}
+
+	return idx, nil
 }
