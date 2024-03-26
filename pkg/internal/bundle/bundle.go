@@ -7,6 +7,7 @@ import (
 	"io/fs"
 
 	"chainguard.dev/apko/pkg/build/types"
+	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
@@ -83,4 +84,9 @@ func New(config *dag.Configuration, base v1.ImageIndex, archs []string, srcfs fs
 	}
 
 	return idx, nil
+}
+
+// Podspec returns bytes of yaml representing a podspec.
+// This is a terrible API that we should change.
+func Podspec(config *dag.Configuration, ref name.Reference) ([]byte, error) {
 }

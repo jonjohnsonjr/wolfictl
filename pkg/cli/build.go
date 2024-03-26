@@ -619,17 +619,6 @@ func (t *task) buildArch(ctx context.Context, arch string) error {
 func (t *task) build(ctx context.Context) error {
 	log := clog.FromContext(ctx)
 
-	sdir, err := t.sourceDir()
-	if err != nil {
-		return err
-	}
-	srcfs := os.DirFS(sdir)
-
-	bundle, err := bundle.New(t.config, t.cfg.base, t.filterArchs(), srcfs)
-	if err != nil {
-		return err
-	}
-
 	archs := t.filterArchs()
 
 	skipByArch := map[string]bool{}
@@ -652,6 +641,16 @@ func (t *task) build(ctx context.Context) error {
 	if len(archs) == 0 {
 		t.skipped = true
 		return nil
+	}
+
+	sdir, err := t.sourceDir()
+	if err != nil {
+		return err
+	}
+
+	bundle, err := bundle.New(t.config, t.cfg.base, archs, os.DirFS(sdir))
+	if err != nil {
+		return err
 	}
 
 	var buildGroup errgroup.Group
