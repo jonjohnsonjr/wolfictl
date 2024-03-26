@@ -26,6 +26,7 @@ import (
 	"github.com/chainguard-dev/go-apk/pkg/apk"
 	charmlog "github.com/charmbracelet/log"
 	"github.com/dominikbraun/graph"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/spf13/cobra"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
@@ -398,6 +399,11 @@ type task struct {
 	started bool
 	done    bool
 	skipped bool
+
+	bundled v1.ImageIndex
+
+	// TODO: This is a hack, refactor the task execution out from the graph walking.
+	bcfg *bundleConfig
 }
 
 func (t *task) gitSDE(ctx context.Context) (string, error) {
@@ -520,7 +526,7 @@ func (t *task) buildArch(ctx context.Context, arch string) error {
 		build.WithExtraRepos(t.cfg.extraRepos),
 		build.WithSigningKey(t.cfg.signingKey),
 		build.WithRunner(runner),
-		build.WithEnvFile(filepath.Join(t.cfg.dir, fmt.Sprintf("build-%s.env", arch))),
+		build.WithEnvFile(filepath.Join(t.cfg.dir, envFile(arch))),
 		build.WithNamespace(t.cfg.namespace),
 		build.WithSourceDir(sdir),
 		build.WithCacheSource(t.cfg.cacheSource),
@@ -599,17 +605,20 @@ func (t *task) build(ctx context.Context) error {
 		return nil
 	}
 
-	for arch := range needsBuild {
+	var buildGroup errgroup.Group
+	for _, arch := range archs {
 		arch := types.ParseArchitecture(arch).ToAPK()
+		buildGroup.Go(func() error {
+			return t.buildArch(ctx, arch)
+		})
+	}
 
-		if t.cfg.dryrun {
-			log.Infof("DRYRUN: would have built %s/%s/%s.apk", t.cfg.outDir, arch, t.pkgver())
-			continue
-		}
+	if err := buildGroup.Wait(); err != nil {
+		return err
+	}
 
-		if err := t.buildArch(ctx, arch); err != nil {
-			return err
-		}
+	if t.cfg.dryrun {
+		return nil
 	}
 
 	if !t.cfg.generateIndex {
@@ -619,50 +628,55 @@ func (t *task) build(ctx context.Context) error {
 	t.cfg.mu.Lock()
 	defer t.cfg.mu.Unlock()
 
-	for arch := range needsIndex {
-		packageDir := filepath.Join(t.cfg.outDir, arch)
-		log.Infof("Generating apk index from packages in %s", packageDir)
+	var indexGroup errgroup.Group
+	for _, arch := range archs {
+		arch := types.ParseArchitecture(arch).ToAPK()
+		indexGroup.Go(func() error {
+			packageDir := filepath.Join(t.cfg.outDir, arch)
+			log.Infof("Generating apk index from packages in %s", packageDir)
 
-		cfg := t.config.Configuration
-		apkFile := t.pkgver() + ".apk"
-		apkPath := filepath.Join(t.cfg.outDir, arch, apkFile)
+			cfg := t.config.Configuration
+			apkFile := t.pkgver() + ".apk"
+			apkPath := filepath.Join(t.cfg.outDir, arch, apkFile)
 
-		if t.cfg.dryrun {
-			log.Infof("DRYRUN: would have indexed %s", apkPath)
-			continue
-		}
+			var apkFiles []string
+			apkFiles = append(apkFiles, apkPath)
 
-		var apkFiles []string
-		apkFiles = append(apkFiles, apkPath)
+			for i := range cfg.Subpackages {
+				// gocritic complains about copying if you do the normal thing because Subpackages is not a slice of pointers.
+				subName := cfg.Subpackages[i].Name
 
-		for i := range cfg.Subpackages {
-			// gocritic complains about copying if you do the normal thing because Subpackages is not a slice of pointers.
-			subName := cfg.Subpackages[i].Name
-
-			subpkgApk := fmt.Sprintf("%s-%s-r%d.apk", subName, cfg.Package.Version, cfg.Package.Epoch)
-			subpkgFileName := filepath.Join(packageDir, subpkgApk)
-			if _, err := os.Stat(subpkgFileName); err != nil {
-				log.Warnf("Skipping subpackage %s (was not built): %v", subpkgFileName, err)
-				continue
+				subpkgApk := fmt.Sprintf("%s-%s-r%d.apk", subName, cfg.Package.Version, cfg.Package.Epoch)
+				subpkgFileName := filepath.Join(packageDir, subpkgApk)
+				if _, err := os.Stat(subpkgFileName); err != nil {
+					log.Warnf("Skipping subpackage %s (was not built): %v", subpkgFileName, err)
+					continue
+				}
+				apkFiles = append(apkFiles, subpkgFileName)
 			}
-			apkFiles = append(apkFiles, subpkgFileName)
-		}
 
-		opts := []index.Option{
-			index.WithPackageFiles(apkFiles),
-			index.WithSigningKey(t.cfg.signingKey),
-			index.WithMergeIndexFileFlag(true),
-			index.WithIndexFile(filepath.Join(packageDir, "APKINDEX.tar.gz")),
-		}
+			opts := []index.Option{
+				index.WithPackageFiles(apkFiles),
+				index.WithSigningKey(t.cfg.signingKey),
+				index.WithMergeIndexFileFlag(true),
+				index.WithIndexFile(filepath.Join(packageDir, "APKINDEX.tar.gz")),
+			}
 
-		idx, err := index.New(opts...)
-		if err != nil {
-			return fmt.Errorf("unable to create index: %w", err)
-		}
+			idx, err := index.New(opts...)
+			if err != nil {
+				return fmt.Errorf("unable to create index: %w", err)
+			}
 
-		if err := idx.GenerateIndex(ctx); err != nil {
-			return fmt.Errorf("unable to generate index: %w", err)
-		}
+			if err := idx.GenerateIndex(ctx); err != nil {
+				return fmt.Errorf("unable to generate index: %w", err)
+			}
+
+			return nil
+		})
+	}
+
+	if err := indexGroup.Wait(); err != nil {
+		return err
 	}
 
 	// TODO: This is where we would update the index.
@@ -715,4 +729,18 @@ func logs(fname string) error {
 	}
 	fmt.Printf("::endgroup::\n")
 	return nil
+}
+
+// TODO: I think this is probably wrong, actually.
+func (t *task) sourceDir() (string, error) {
+	sdir := filepath.Join(t.cfg.dir, t.pkg)
+	if _, err := os.Stat(sdir); os.IsNotExist(err) {
+		if err := os.MkdirAll(sdir, os.ModePerm); err != nil {
+			return "", fmt.Errorf("creating source directory %s: %v", sdir, err)
+		}
+	} else if err != nil {
+		return "", fmt.Errorf("creating source directory: %v", err)
+	}
+
+	return sdir, nil
 }
