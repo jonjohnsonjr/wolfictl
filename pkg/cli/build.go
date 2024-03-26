@@ -470,27 +470,22 @@ func (t *task) filterArchs() []string {
 	return filtered
 }
 
-func (t *task) buildArch(ctx context.Context, arch string) (skipped bool, err error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
+func (t *task) pkgver() string {
+	return fmt.Sprintf("%s-%s-r%d", t.config.Package.Name, t.config.Package.Version, t.config.Package.Epoch)
+}
 
+func (t *task) shouldSkip(ctx context.Context, arch string) (bool, error) {
 	log := clog.FromContext(ctx)
-	cfg := t.config.Configuration
-
-	pkgver := fmt.Sprintf("%s-%s-r%d", cfg.Package.Name, cfg.Package.Version, cfg.Package.Epoch)
-	logDir := t.cfg.logdir(arch)
-	logfile := filepath.Join(logDir, pkgver) + ".log"
 
 	// See if we already have the package built.
-	apkFile := pkgver + ".apk"
+	apkFile := t.pkgver() + ".apk"
+	apkPath := filepath.Join(t.cfg.outDir, arch, apkFile)
 
 	if _, ok := t.cfg.exists[arch][apkFile]; ok {
 		log.Debugf("Skipping %s, already indexed", apkFile)
 		return true, nil
 	}
 
-	apkPath := filepath.Join(t.cfg.outDir, arch, apkFile)
 	if _, err := os.Stat(apkPath); err == nil {
 		log.Debugf("Skipping %s, already built", apkPath)
 		return true, nil
@@ -498,12 +493,24 @@ func (t *task) buildArch(ctx context.Context, arch string) (skipped bool, err er
 
 	if t.cfg.dryrun {
 		log.Infof("DRYRUN: would have built %s", apkPath)
-		return false, nil
+		return true, nil
 	}
+
+	return false, nil
+}
+
+func (t *task) buildArch(ctx context.Context, arch string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	log := clog.FromContext(ctx)
+	logDir := t.cfg.logdir(arch)
+	logfile := filepath.Join(logDir, t.pkgver()) + ".log"
 
 	f, err := os.Create(logfile)
 	if err != nil {
-		return false, fmt.Errorf("creating logfile: %w", err)
+		return fmt.Errorf("creating logfile: %w", err)
 	}
 	defer f.Close()
 
@@ -518,20 +525,20 @@ func (t *task) buildArch(ctx context.Context, arch string) (skipped bool, err er
 	sdir := filepath.Join(t.cfg.dir, t.pkg)
 	if _, err := os.Stat(sdir); os.IsNotExist(err) {
 		if err := os.MkdirAll(sdir, os.ModePerm); err != nil {
-			return false, fmt.Errorf("creating source directory %s: %v", sdir, err)
+			return fmt.Errorf("creating source directory %s: %v", sdir, err)
 		}
 	} else if err != nil {
-		return false, fmt.Errorf("creating source directory: %v", err)
+		return fmt.Errorf("creating source directory: %v", err)
 	}
 
 	runner, err := newRunner(fctx, t.cfg.runner)
 	if err != nil {
-		return false, fmt.Errorf("creating runner: %w", err)
+		return fmt.Errorf("creating runner: %w", err)
 	}
 
 	sde, err := t.gitSDE(ctx)
 	if err != nil {
-		return false, fmt.Errorf("finding source date epoch: %w", err)
+		return fmt.Errorf("finding source date epoch: %w", err)
 	}
 
 	log.Infof("Building %s", t.pkg)
@@ -552,11 +559,8 @@ func (t *task) buildArch(ctx context.Context, arch string) (skipped bool, err er
 		build.WithBuildDate(sde),
 		build.WithRemove(true),
 	)
-	if errors.Is(err, build.ErrSkipThisArch) {
-		log.Warnf("Skipping arch %s", arch)
-		return true, nil
-	} else if err != nil {
-		return false, err
+	if err != nil {
+		return err
 	}
 	defer func() {
 		// We Close() with the original context if we're cancelled so we get cleanup logs to stderr.
@@ -582,10 +586,10 @@ func (t *task) buildArch(ctx context.Context, arch string) (skipped bool, err er
 			clog.FromContext(ctx).Errorf("failed to read logs %q: %v", logfile, err)
 		}
 
-		return false, fmt.Errorf("building package (see %q for logs): %w", logfile, err)
+		return fmt.Errorf("building package (see %q for logs): %w", logfile, err)
 	}
 
-	return false, nil
+	return nil
 }
 
 func (t *task) build(ctx context.Context) error {
@@ -593,26 +597,31 @@ func (t *task) build(ctx context.Context) error {
 
 	archs := t.filterArchs()
 
-	skippedByArch := map[string]bool{}
+	skipByArch := map[string]bool{}
 	for _, arch := range archs {
-		arch := types.ParseArchitecture(arch).ToAPK()
-
-		skipped, err := t.buildArch(ctx, arch)
+		shouldSkip, err := t.shouldSkip(ctx, arch)
 		if err != nil {
 			return err
 		}
-
-		skippedByArch[arch] = skipped
+		skipByArch[arch] = shouldSkip
 	}
 
 	// Note that this intentionally mutates archs to avoid unecessary index generation below.
 	archs = slices.DeleteFunc(archs, func(arch string) bool {
-		return skippedByArch[arch]
+		return skipByArch[arch]
 	})
 
 	if len(archs) == 0 {
 		t.skipped = true
 		return nil
+	}
+
+	for _, arch := range archs {
+		arch := types.ParseArchitecture(arch).ToAPK()
+
+		if err := t.buildArch(ctx, arch); err != nil {
+			return err
+		}
 	}
 
 	if t.cfg.dryrun {
@@ -631,8 +640,7 @@ func (t *task) build(ctx context.Context) error {
 		log.Infof("Generating apk index from packages in %s", packageDir)
 
 		cfg := t.config.Configuration
-		pkgver := fmt.Sprintf("%s-%s-r%d", cfg.Package.Name, cfg.Package.Version, cfg.Package.Epoch)
-		apkFile := pkgver + ".apk"
+		apkFile := t.pkgver() + ".apk"
 		apkPath := filepath.Join(t.cfg.outDir, arch, apkFile)
 
 		var apkFiles []string
