@@ -195,45 +195,5 @@ func Podspec(config *dag.Configuration, ref name.Reference, arch string) *corev1
 		})
 	}
 
-	if pt := c.PodTemplate; pt != nil {
-		if pt.Volumes != nil {
-			pod.Spec.Volumes = append(pod.Spec.Volumes, pt.Volumes...)
-		}
-
-		if pt.VolumeMounts != nil {
-			// Only mount to the workspace container
-			pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, pt.VolumeMounts...)
-		}
-
-		for k, v := range pt.NodeSelector {
-			pod.Spec.NodeSelector[k] = v
-		}
-
-		if pt.Affinity != nil {
-			pod.Spec.Affinity = pt.Affinity
-		}
-
-		if pt.RuntimeClassName != nil {
-			pod.Spec.RuntimeClassName = pt.RuntimeClassName
-		}
-
-		if pt.Env != nil {
-			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, pt.Env...)
-		}
-
-		if pt.ServiceAccountName != "" {
-			pod.Spec.ServiceAccountName = pt.ServiceAccountName
-		}
-	}
-
-	switch c.Provider {
-	case "gke":
-		// Be specific here, since not all regions support all compute classes
-		// Ref: https://cloud.google.com/kubernetes-engine/docs/concepts/autopilot-compute-classes
-		if cfg.Arch == apko_types.Architecture("arm64") {
-			pod.Spec.NodeSelector["cloud.google.com/compute-class"] = "Scale-Out"
-		}
-	}
-
 	return pod
 }

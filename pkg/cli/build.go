@@ -652,6 +652,8 @@ func (t *task) build(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// TODO
+	_ = bundle
 
 	var buildGroup errgroup.Group
 	for _, arch := range archs {
