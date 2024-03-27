@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"testing/fstest"
 	"time"
 
 	"chainguard.dev/apko/pkg/build/types"
@@ -103,6 +105,11 @@ func cmdBuild() *cobra.Command {
 					return err
 				}
 				cfg.base, err = remote.Index(ref)
+				if err != nil {
+					return err
+				}
+
+				cfg.commonFiles, err = commonFS(os.DirFS(cfg.dir))
 				if err != nil {
 					return err
 				}
@@ -395,9 +402,10 @@ type global struct {
 	cacheDir    string
 	outDir      string
 
-	baseRef string
-	base    v1.ImageIndex
-	repo    string
+	baseRef     string
+	base        v1.ImageIndex
+	repo        string
+	commonFiles fs.FS
 
 	// arch -> foo.apk -> exists in APKINDEX
 	exists map[string]map[string]struct{}
@@ -574,7 +582,7 @@ func (t *task) buildArch(ctx context.Context, arch string) error {
 		build.WithExtraRepos(t.cfg.extraRepos),
 		build.WithSigningKey(t.cfg.signingKey),
 		build.WithRunner(runner),
-		build.WithEnvFile(filepath.Join(t.cfg.dir, fmt.Sprintf("build-%s.env", arch))),
+		build.WithEnvFile(filepath.Join(t.cfg.dir, envFile(arch))),
 		build.WithNamespace(t.cfg.namespace),
 		build.WithSourceDir(sdir),
 		build.WithCacheSource(t.cfg.cacheSource),
@@ -648,7 +656,33 @@ func (t *task) build(ctx context.Context) error {
 		return err
 	}
 
-	bundle, err := bundle.New(t.config, t.cfg.base, archs, os.DirFS(sdir))
+	entrypoints := map[string]*bundle.Entrypoint{}
+
+	for _, arch := range archs {
+		flags := []string{
+			"--arch=" + arch,
+			"--envfile=" + envFile(arch),
+			"--runner=" + t.cfg.runner,
+			"--namespace=" + t.cfg.namespace,
+			"--source-dir=" + sdir,
+			"--signing-key=" + t.cfg.signingKey,
+		}
+
+		for _, k := range t.cfg.extraKeys {
+			flags = append(flags, "--keyring-append="+k)
+		}
+
+		for _, r := range t.cfg.extraRepos {
+			flags = append(flags, "--repository-append="+r)
+		}
+
+		entrypoints[arch] = &bundle.Entrypoint{
+			File:  t.config.Path,
+			Flags: flags,
+		}
+	}
+
+	bundle, err := bundle.New(t.config, t.cfg.base, entrypoints, t.cfg.commonFiles, os.DirFS(sdir))
 	if err != nil {
 		return err
 	}
@@ -793,4 +827,57 @@ func (t *task) sourceDir() (string, error) {
 	}
 
 	return sdir, nil
+}
+
+func envFile(arch string) string {
+	return fmt.Sprintf("build-%s.env", arch)
+}
+
+func commonFS(dirfs fs.FS) (fs.FS, error) {
+	mapfs := fstest.MapFS{}
+
+	envs, err := fs.Glob(dirfs, "build-*.env")
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range envs {
+		data, err := fs.ReadFile(dirfs, name)
+		if err != nil {
+			return nil, err
+		}
+		info, err := fs.Stat(dirfs, name)
+		if err != nil {
+			return nil, err
+		}
+
+		mapfs[name] = &fstest.MapFile{
+			Data:    data,
+			Mode:    info.Mode(),
+			ModTime: info.ModTime(),
+			Sys:     info.Sys(),
+		}
+	}
+
+	if err := fs.WalkDir(dirfs, "pipelines", func(p string, d fs.DirEntry, err error) error {
+		data, err := fs.ReadFile(dirfs, p)
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		mapfs[p] = &fstest.MapFile{
+			Data:    data,
+			Mode:    info.Mode(),
+			ModTime: info.ModTime(),
+			Sys:     info.Sys(),
+		}
+
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return mapfs, nil
 }

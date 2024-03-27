@@ -17,6 +17,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/partial"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/wolfi-dev/wolfictl/pkg/dag"
+	"golang.org/x/exp/maps"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -47,8 +48,39 @@ func init() {
 	entrypointTmpl = template.Must(template.New("entrypointTemplate").Parse(entrypointTemplate))
 }
 
-func entrypoint(w io.Writer, flags []string) error {
-	return entrypointTmpl.Execute(w, flags)
+func renderEntrypoint(entrypoint *Entrypoint) (v1.Layer, error) {
+	var tbuf bytes.Buffer
+	tw := tar.NewWriter(&tbuf)
+
+	var ebuf bytes.Buffer
+	if err := entrypointTmpl.Execute(&ebuf, entrypoint); err != nil {
+		return nil, err
+	}
+
+	eb := ebuf.Bytes()
+
+	hdr := &tar.Header{
+		Name: "entrypoint.sh",
+		Mode: 0755,
+		Size: int64(len(eb)),
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		return nil, err
+	}
+
+	if _, err := tw.Write(eb); err != nil {
+		return nil, err
+	}
+
+	if err := tw.Close(); err != nil {
+		return nil, err
+	}
+
+	opener := func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(tbuf.Bytes())), nil
+	}
+
+	return tarball.LayerFromOpener(opener)
 }
 
 // todo: optimize this if it matters (it probably doesn't)
@@ -71,14 +103,14 @@ func layer(srcfs fs.FS) (v1.Layer, error) {
 	return tarball.LayerFromOpener(opener)
 }
 
-func New(config *dag.Configuration, base v1.ImageIndex, archs []string, srcfs fs.FS) (v1.ImageIndex, error) {
+func New(config *dag.Configuration, base v1.ImageIndex, entrypoints map[string]*Entrypoint, commonfiles, srcfs fs.FS) (v1.ImageIndex, error) {
 	m, err := base.IndexManifest()
 	if err != nil {
 		return nil, err
 	}
 
 	wantArchs := map[string]struct{}{}
-	for _, arch := range archs {
+	for arch := range entrypoints {
 		wantArchs[types.ParseArchitecture(arch).ToAPK()] = struct{}{}
 	}
 
@@ -95,12 +127,27 @@ func New(config *dag.Configuration, base v1.ImageIndex, archs []string, srcfs fs
 			return nil, err
 		}
 
-		layer, err := layer(srcfs)
+		commonLayer, err := layer(commonfiles)
 		if err != nil {
 			return nil, err
 		}
 
-		img, err := mutate.AppendLayers(baseImg, layer)
+		sourceLayer, err := layer(srcfs)
+		if err != nil {
+			return nil, err
+		}
+
+		entrypoint, ok := entrypoints[arch]
+		if !ok {
+			return nil, fmt.Errorf("unexpected arch %q for entrypoints: %v", arch, maps.Keys(entrypoints))
+		}
+
+		entrypointLayer, err := renderEntrypoint(entrypoint)
+		if err != nil {
+			return nil, err
+		}
+
+		img, err := mutate.AppendLayers(baseImg, commonLayer, sourceLayer, entrypointLayer)
 		if err != nil {
 			return nil, err
 		}
