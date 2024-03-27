@@ -693,7 +693,12 @@ func (t *task) build(ctx context.Context) error {
 			}
 		}
 
-		bundle, err := bundle.New(t.config, t.cfg.base, entrypoints, t.cfg.commonFiles, os.DirFS(sdir))
+		srcfs, err := t.sourceFS(os.DirFS(t.cfg.dir))
+		if err != nil {
+			return err
+		}
+
+		bundle, err := bundle.New(t.config, t.cfg.base, entrypoints, t.cfg.commonFiles, srcfs)
 		if err != nil {
 			return err
 		}
@@ -850,8 +855,57 @@ func (t *task) sourceDir() (string, error) {
 	return sdir, nil
 }
 
-func envFile(arch string) string {
-	return fmt.Sprintf("build-%s.env", arch)
+func (t *task) sourceFS(dirfs fs.FS) (fs.FS, error) {
+	sdir, err := t.sourceDir()
+	if err != nil {
+		return nil, err
+	}
+
+	mapfs := fstest.MapFS{}
+
+	name := t.config.Path
+
+	data, err := fs.ReadFile(dirfs, name)
+	if err != nil {
+		return nil, err
+	}
+	info, err := fs.Stat(dirfs, name)
+	if err != nil {
+		return nil, err
+	}
+
+	mapfs[name] = &fstest.MapFile{
+		Data:    data,
+		Mode:    info.Mode(),
+		ModTime: info.ModTime(),
+		Sys:     info.Sys(),
+	}
+
+	if err := fs.WalkDir(dirfs, sdir, func(p string, d fs.DirEntry, err error) error {
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		mapf := &fstest.MapFile{
+			Mode:    info.Mode(),
+			ModTime: info.ModTime(),
+			Sys:     info.Sys(),
+		}
+
+		if !info.IsDir() {
+			mapf.Data, err = fs.ReadFile(dirfs, p)
+			if err != nil {
+				return err
+			}
+		}
+
+		mapfs[p] = mapf
+
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return mapfs, nil
 }
 
 func commonFS(dirfs fs.FS) (fs.FS, error) {
@@ -880,20 +934,24 @@ func commonFS(dirfs fs.FS) (fs.FS, error) {
 	}
 
 	if err := fs.WalkDir(dirfs, "pipelines", func(p string, d fs.DirEntry, err error) error {
-		data, err := fs.ReadFile(dirfs, p)
-		if err != nil {
-			return err
-		}
 		info, err := d.Info()
 		if err != nil {
 			return err
 		}
-		mapfs[p] = &fstest.MapFile{
-			Data:    data,
+		mapf := &fstest.MapFile{
 			Mode:    info.Mode(),
 			ModTime: info.ModTime(),
 			Sys:     info.Sys(),
 		}
+
+		if !info.IsDir() {
+			mapf.Data, err = fs.ReadFile(dirfs, p)
+			if err != nil {
+				return err
+			}
+		}
+
+		mapfs[p] = mapf
 
 		return nil
 	}); err != nil {
@@ -901,4 +959,8 @@ func commonFS(dirfs fs.FS) (fs.FS, error) {
 	}
 
 	return mapfs, nil
+}
+
+func envFile(arch string) string {
+	return fmt.Sprintf("build-%s.env", arch)
 }
