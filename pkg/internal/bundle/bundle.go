@@ -10,6 +10,7 @@ import (
 	"text/template"
 
 	"chainguard.dev/apko/pkg/build/types"
+	"chainguard.dev/melange/pkg/config"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
@@ -152,6 +153,18 @@ func New(config *dag.Configuration, base v1.ImageIndex, entrypoints map[string]*
 			return nil, err
 		}
 
+		cf, err := img.ConfigFile()
+		if err != nil {
+			return nil, err
+		}
+
+		cf.Config.Entrypoint = []string{"/bin/sh", "entrypoint.sh"}
+
+		img, err = mutate.ConfigFile(img, cf)
+		if err != nil {
+			return nil, err
+		}
+
 		newDesc, err := partial.Descriptor(img)
 		if err != nil {
 			return nil, err
@@ -177,12 +190,17 @@ func escapeRFC1123(name string) string {
 
 // Podspec returns bytes of yaml representing a podspec.
 // This is a terrible API that we should change.
-func Podspec(config *dag.Configuration, ref name.Reference, arch string) *corev1.Pod {
-	resources := config.Package.Resources
+func Podspec(cfg *dag.Configuration, ref name.Reference, arch string) *corev1.Pod {
+	goarch := types.ParseArchitecture(arch).String()
+
+	resources := cfg.Package.Resources
+	if resources == nil {
+		resources = &config.Resources{}
+	}
 
 	// Set some sane default resource requests if none are specified by flag or config.
 	// This is required for GKE Autopilot.
-	if resources.CPU == "0" {
+	if resources.CPU == "" {
 		resources.CPU = "2"
 	}
 	if resources.Memory == "" {
@@ -198,13 +216,13 @@ func Podspec(config *dag.Configuration, ref name.Reference, arch string) *corev1
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: fmt.Sprintf("melange-builder-%s-%s-", escapeRFC1123(config.Package.Name), arch),
+			GenerateName: fmt.Sprintf("melange-builder-%s-%s-", escapeRFC1123(cfg.Package.Name), arch),
 			Namespace:    "default",
 			Labels: map[string]string{
-				"kubernetes.io/arch":             arch,
-				"app.kubernetes.io/component":    config.Package.Name,
-				"melange.chainguard.dev/arch":    types.Architecture(arch).ToOCIPlatform().Architecture,
-				"melange.chainguard.dev/package": config.Package.Name,
+				"kubernetes.io/arch":             goarch,
+				"app.kubernetes.io/component":    cfg.Package.Name,
+				"melange.chainguard.dev/arch":    goarch,
+				"melange.chainguard.dev/package": cfg.Package.Name,
 			},
 			Annotations: map[string]string{},
 		},
@@ -214,16 +232,16 @@ func Podspec(config *dag.Configuration, ref name.Reference, arch string) *corev1
 			Containers: []corev1.Container{{
 				Name:  "workspace",
 				Image: ref.String(),
-				// TODO: DO NOT SUBMIT: Do we need this?
+				// TODO: Do we need this??
 				// ldconfig is run to prime ld.so.cache for glibc packages which require it.
-				Command:      []string{"/bin/sh", "-c", "[ -x /sbin/ldconfig ] && /sbin/ldconfig /lib || true\nsleep infinity"},
+				// Command:      []string{"/bin/sh", "-c", "[ -x /sbin/ldconfig ] && /sbin/ldconfig /lib || true\nsleep infinity"},
 				Resources:    rr,
 				VolumeMounts: []corev1.VolumeMount{},
 			}},
 			RestartPolicy:                corev1.RestartPolicyNever,
 			AutomountServiceAccountToken: ptr.Bool(false),
 			NodeSelector: map[string]string{
-				"kubernetes.io/arch": arch,
+				"kubernetes.io/arch": goarch,
 			},
 			ServiceAccountName: "default",
 			SecurityContext: &corev1.PodSecurityContext{
@@ -235,7 +253,7 @@ func Podspec(config *dag.Configuration, ref name.Reference, arch string) *corev1
 		},
 	}
 
-	for k, v := range config.Environment.Environment {
+	for k, v := range cfg.Environment.Environment {
 		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
 			Name:  k,
 			Value: v,

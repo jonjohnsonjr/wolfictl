@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -698,7 +699,7 @@ func (t *task) build(ctx context.Context) error {
 			return err
 		}
 
-		bundle, err := bundle.New(t.config, t.cfg.base, entrypoints, t.cfg.commonFiles, srcfs)
+		bundled, err := bundle.New(t.config, t.cfg.base, entrypoints, t.cfg.commonFiles, srcfs)
 		if err != nil {
 			return err
 		}
@@ -708,11 +709,20 @@ func (t *task) build(ctx context.Context) error {
 			return err
 		}
 
-		if err := t.cfg.pusher.Push(ctx, dst, bundle); err != nil {
+		if err := t.cfg.pusher.Push(ctx, dst, bundled); err != nil {
 			return err
 		}
 
 		log.Infof("pushed bundle to %s", dst.String())
+
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		for _, arch := range archs {
+			spec := bundle.Podspec(t.config, dst, arch)
+			if err := enc.Encode(spec); err != nil {
+				return err
+			}
+		}
 	}
 
 	var buildGroup errgroup.Group
