@@ -28,6 +28,7 @@ import (
 	"github.com/chainguard-dev/go-apk/pkg/apk"
 	charmlog "github.com/charmbracelet/log"
 	"github.com/dominikbraun/graph"
+	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
@@ -113,6 +114,14 @@ func cmdBuild() *cobra.Command {
 				if err != nil {
 					return err
 				}
+			}
+
+			if cfg.repo != "" {
+				pusher, err := remote.NewPusher(remote.WithAuthFromKeychain(authn.DefaultKeychain), remote.WithUserAgent("jon"))
+				if err != nil {
+					return err
+				}
+				cfg.pusher = pusher
 			}
 
 			return buildAll(ctx, &cfg, args)
@@ -406,6 +415,7 @@ type global struct {
 	base        v1.ImageIndex
 	repo        string
 	commonFiles fs.FS
+	pusher      *remote.Pusher
 
 	// arch -> foo.apk -> exists in APKINDEX
 	exists map[string]map[string]struct{}
@@ -656,38 +666,49 @@ func (t *task) build(ctx context.Context) error {
 		return err
 	}
 
-	entrypoints := map[string]*bundle.Entrypoint{}
+	if t.cfg.repo != "" {
+		entrypoints := map[string]*bundle.Entrypoint{}
 
-	for _, arch := range archs {
-		flags := []string{
-			"--arch=" + arch,
-			"--envfile=" + envFile(arch),
-			"--runner=" + t.cfg.runner,
-			"--namespace=" + t.cfg.namespace,
-			"--source-dir=" + sdir,
-			"--signing-key=" + t.cfg.signingKey,
+		for _, arch := range archs {
+			flags := []string{
+				"--arch=" + arch,
+				"--envfile=" + envFile(arch),
+				"--runner=" + t.cfg.runner,
+				"--namespace=" + t.cfg.namespace,
+				"--source-dir=" + sdir,
+				"--signing-key=" + t.cfg.signingKey,
+			}
+
+			for _, k := range t.cfg.extraKeys {
+				flags = append(flags, "--keyring-append="+k)
+			}
+
+			for _, r := range t.cfg.extraRepos {
+				flags = append(flags, "--repository-append="+r)
+			}
+
+			entrypoints[arch] = &bundle.Entrypoint{
+				File:  t.config.Path,
+				Flags: flags,
+			}
 		}
 
-		for _, k := range t.cfg.extraKeys {
-			flags = append(flags, "--keyring-append="+k)
+		bundle, err := bundle.New(t.config, t.cfg.base, entrypoints, t.cfg.commonFiles, os.DirFS(sdir))
+		if err != nil {
+			return err
 		}
 
-		for _, r := range t.cfg.extraRepos {
-			flags = append(flags, "--repository-append="+r)
+		dst, err := name.ParseReference(fmt.Sprintf("%s/%s", t.cfg.repo, t.pkgver()))
+		if err != nil {
+			return err
 		}
 
-		entrypoints[arch] = &bundle.Entrypoint{
-			File:  t.config.Path,
-			Flags: flags,
+		if err := t.cfg.pusher.Push(ctx, dst, bundle); err != nil {
+			return err
 		}
+
+		log.Infof("pushed bundle to %s", dst.String())
 	}
-
-	bundle, err := bundle.New(t.config, t.cfg.base, entrypoints, t.cfg.commonFiles, os.DirFS(sdir))
-	if err != nil {
-		return err
-	}
-	// TODO
-	_ = bundle
 
 	var buildGroup errgroup.Group
 	for _, arch := range archs {
