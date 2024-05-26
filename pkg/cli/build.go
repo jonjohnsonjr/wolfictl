@@ -47,6 +47,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/wolfi-dev/wolfictl/pkg/dag"
+	"github.com/wolfi-dev/wolfictl/pkg/internal/batch"
 	"github.com/wolfi-dev/wolfictl/pkg/internal/bundle"
 	"github.com/wolfi-dev/wolfictl/pkg/tar"
 )
@@ -121,6 +122,17 @@ func cmdBuild() *cobra.Command {
 					return fmt.Errorf("creating gcs client: %w", err)
 				}
 				cfg.gcs = client
+
+				cfg.indexer = &indexer{
+					writeLimiter: rate.NewLimiter(rate.Every(1*time.Second), 1),
+					gcs:          client,
+					dstBucket:    cfg.dstBucket,
+					signingKey:   cfg.signingKey,
+					outDir:       cfg.outDir,
+				}
+
+				// TODO: This is a mess, clean things up a bit.
+				cfg.indexer.batch = batch.New(cfg.indexer.indexBundles)
 
 				return buildBundles(ctx, &cfg, cfg.bundle)
 			}
@@ -584,13 +596,16 @@ type global struct {
 
 	fuses []string
 
+	writeLimiter *rate.Limiter
+
 	// arch -> foo.apk -> exists in APKINDEX
 	exists map[string]map[string]struct{}
 
 	mu sync.Mutex
 
+	indexer *indexer
+
 	bundle        string
-	writeLimiter  *rate.Limiter
 	gcs           *storage.Client
 	stagingBucket string
 	dstBucket     string
@@ -602,14 +617,6 @@ type global struct {
 
 func (g *global) logdir(arch string) string {
 	return filepath.Join(g.outDir, arch, "buildlogs")
-}
-
-// wrapper around the writeLimiter so this is accounted for in traces
-func (g *global) wait(ctx context.Context) error {
-	ctx, span := otel.Tracer("wolfictl").Start(ctx, "wait")
-	defer span.End()
-
-	return g.writeLimiter.Wait(ctx)
 }
 
 type task struct {
@@ -1107,24 +1114,33 @@ func (t *task) buildBundle(ctx context.Context) error {
 		return nil
 	}
 
-	t.cfg.mu.Lock()
-	defer t.cfg.mu.Unlock()
-
 	log.Infof("Processing results: %s", t.pkg)
 
-	var indexGroup errgroup.Group
+	var imu sync.Mutex
+	toIndex := map[string][]string{}
+	var pkgGroup errgroup.Group
 	for arch, need := range needsIndex {
 		if !need {
 			continue
 		}
 
 		arch := types.ParseArchitecture(arch).ToAPK()
-		indexGroup.Go(func() error {
-			return t.indexBundle(ctx, arch, results)
+		pkgGroup.Go(func() error {
+			todo, err := t.uploadBundle(ctx, arch, results)
+			if err != nil {
+				return err
+			}
+
+			imu.Lock()
+			defer imu.Unlock()
+
+			toIndex[arch] = todo
+
+			return nil
 		})
 	}
 
-	if err := indexGroup.Wait(); err != nil {
+	if err := pkgGroup.Wait(); err != nil {
 		return fmt.Errorf("failed to regenerate index: %w", err)
 	}
 
@@ -1134,42 +1150,23 @@ func (t *task) buildBundle(ctx context.Context) error {
 	}
 
 	log.Infof("Uploading APKINDEX: %s", t.pkg)
-
-	// We do this after indexGroup because we only want to upload them if all archs succeeded.
-	var uploadGroup errgroup.Group
-	for arch, need := range needsIndex {
-		if !need {
-			continue
-		}
-
-		arch := types.ParseArchitecture(arch).ToAPK()
-
-		uploadGroup.Go(func() error {
-			return t.uploadIndex(ctx, arch)
-		})
-	}
-
-	if err := uploadGroup.Wait(); err != nil {
-		return fmt.Errorf("uploading indexes: %w", err)
-	}
-
-	return nil
+	return t.cfg.indexer.updateIndex(ctx, &indexTask{toIndex})
 }
 
-func (t *task) indexBundle(ctx context.Context, arch string, results map[string]*bundleResult) error {
-	ctx, span := otel.Tracer("wolfictl").Start(ctx, "indexBundle")
+func (t *task) uploadBundle(ctx context.Context, arch string, results map[string]*bundleResult) ([]string, error) {
+	ctx, span := otel.Tracer("wolfictl").Start(ctx, "uploadBundle")
 	defer span.End()
 
 	log := clog.FromContext(ctx)
 	tmpdir, err := os.MkdirTemp("", "")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer os.RemoveAll(tmpdir)
 
 	packageDir := filepath.Join(tmpdir, arch)
 	if err := os.MkdirAll(packageDir, os.ModePerm); err != nil {
-		return err
+		return nil, err
 	}
 
 	apkFiles := make([]string, 0, len(t.bundle.Subpackages)+1)
@@ -1180,7 +1177,7 @@ func (t *task) indexBundle(ctx context.Context, arch string, results map[string]
 	res, ok := results[arch]
 	if ok {
 		if err := t.fetchResult(ctx, res, tmpdir); err != nil {
-			return fmt.Errorf("fetching bundle output: %w", err)
+			return nil, fmt.Errorf("fetching bundle output: %w", err)
 		}
 
 		for _, subName := range t.bundle.Subpackages {
@@ -1193,7 +1190,7 @@ func (t *task) indexBundle(ctx context.Context, arch string, results map[string]
 
 			log.Debugf("re-signing %s", subpkgApk)
 			if err := sign.APK(ctx, subpkgFileName, t.cfg.signingKey); err != nil {
-				return fmt.Errorf("signing %s: %w", subpkgApk, err)
+				return nil, fmt.Errorf("signing %s: %w", subpkgApk, err)
 			}
 
 			apkFiles = append(apkFiles, subpkgFileName)
@@ -1204,13 +1201,13 @@ func (t *task) indexBundle(ctx context.Context, arch string, results map[string]
 		// It's important that we upload it last so that we know all the other APKs were also uploaded.
 		log.Debugf("re-signing %s", apkFile)
 		if err := sign.APK(ctx, apkPath, t.cfg.signingKey); err != nil {
-			return fmt.Errorf("signing %s: %w", apkFile, err)
+			return nil, fmt.Errorf("signing %s: %w", apkFile, err)
 		}
 
 		apkFiles = append(apkFiles, apkPath)
 
 		if err := t.uploadAPKs(ctx, arch, apkFiles); err != nil {
-			return err
+			return nil, err
 		}
 	} else {
 		for _, subName := range t.bundle.Subpackages {
@@ -1222,40 +1219,76 @@ func (t *task) indexBundle(ctx context.Context, arch string, results map[string]
 					log.Warnf("Skipping subpackage %s (was not built): %v", subpkgApk, err)
 					continue
 				}
-				return err
+				return nil, err
 			}
 
 			apkFiles = append(apkFiles, subpkgFileName)
 		}
 
 		if err := t.downloadAPK(ctx, arch, packageDir, apkFile); err != nil {
-			return err
+			return nil, err
 		}
 
 		apkFiles = append(apkFiles, apkPath)
 	}
 
-	opts := []index.Option{
-		index.WithPackageFiles(apkFiles),
-		index.WithSigningKey(t.cfg.signingKey),
-		index.WithMergeIndexFileFlag(true),
-		index.WithIndexFile(filepath.Join(t.cfg.outDir, arch, "APKINDEX.tar.gz")),
+	return apkFiles, nil
+}
+
+func (i *indexer) indexBundles(ctx context.Context, its []*indexTask) error {
+	ctx, span := otel.Tracer("wolfictl").Start(ctx, "indexBundles")
+	defer span.End()
+
+	filesByArch := map[string][]string{}
+	for _, it := range its {
+		for arch, files := range it.files {
+			filesByArch[arch] = append(filesByArch[arch], files...)
+		}
 	}
 
-	idx, err := index.New(opts...)
-	if err != nil {
-		return fmt.Errorf("unable to create index: %w", err)
+	var g errgroup.Group
+	for arch, files := range filesByArch {
+		arch, files := arch, files
+
+		g.Go(func() error {
+			opts := []index.Option{
+				index.WithPackageFiles(files),
+				index.WithSigningKey(i.signingKey),
+				index.WithMergeIndexFileFlag(true),
+				index.WithIndexFile(filepath.Join(i.outDir, arch, "APKINDEX.tar.gz")),
+			}
+
+			idx, err := index.New(opts...)
+			if err != nil {
+				return fmt.Errorf("unable to create index: %w", err)
+			}
+
+			// GenerateIndex is a little too chatty for my liking, so only log warnings and up.
+			quiet := clog.New(charmlog.NewWithOptions(os.Stderr, charmlog.Options{ReportTimestamp: true, Level: charmlog.WarnLevel}))
+			qctx := clog.WithLogger(ctx, quiet)
+
+			if err := idx.GenerateIndex(qctx); err != nil {
+				return fmt.Errorf("unable to generate index: %w", err)
+			}
+
+			return nil
+		})
 	}
 
-	// GenerateIndex is a little too chatty for my liking, so only log warnings and up.
-	quiet := clog.New(charmlog.NewWithOptions(os.Stderr, charmlog.Options{ReportTimestamp: true, Level: charmlog.WarnLevel}))
-	qctx := clog.WithLogger(ctx, quiet)
-
-	if err := idx.GenerateIndex(qctx); err != nil {
-		return fmt.Errorf("unable to generate index: %w", err)
+	if err := g.Wait(); err != nil {
+		return fmt.Errorf("indexing bundles: %w", err)
 	}
 
-	return nil
+	var uploadGroup errgroup.Group
+	for arch := range filesByArch {
+		arch := arch
+
+		g.Go(func() error {
+			return i.uploadIndex(ctx, arch)
+		})
+	}
+
+	return uploadGroup.Wait()
 }
 
 func (t *task) downloadAPK(ctx context.Context, arch, pkgdir, apkfile string) error {
@@ -1364,9 +1397,6 @@ func (t *task) uploadAPKs(ctx context.Context, arch string, apkFiles []string) e
 			return err
 		}
 
-		if err := t.cfg.wait(ctx); err != nil {
-			return fmt.Errorf("waiting for rate limit: %w", err)
-		}
 		wc := t.cfg.gcs.Bucket(bucket).Object(obj).NewWriter(ctx)
 
 		// We are attempting to avoid 429s from GCS, remove this line if it doesn't help.
@@ -1384,11 +1414,11 @@ func (t *task) uploadAPKs(ctx context.Context, arch string, apkFiles []string) e
 	return nil
 }
 
-func (t *task) uploadIndex(ctx context.Context, arch string) error {
+func (i *indexer) uploadIndex(ctx context.Context, arch string) error {
 	ctx, span := otel.Tracer("wolfictl").Start(ctx, "uploadIndex")
 	defer span.End()
 
-	filename := filepath.Join(t.cfg.outDir, arch, "APKINDEX.tar.gz")
+	filename := filepath.Join(i.outDir, arch, "APKINDEX.tar.gz")
 
 	f, err := os.Open(filename)
 	if err != nil {
@@ -1396,15 +1426,15 @@ func (t *task) uploadIndex(ctx context.Context, arch string) error {
 	}
 
 	obj := path.Join(arch, "APKINDEX.tar.gz")
-	bucket, dir, ok := strings.Cut(t.cfg.dstBucket, "/")
+	bucket, dir, ok := strings.Cut(i.dstBucket, "/")
 	if ok {
 		obj = path.Join(dir, obj)
 	}
 
-	if err := t.cfg.wait(ctx); err != nil {
+	if err := i.wait(ctx); err != nil {
 		return fmt.Errorf("waiting for rate limit: %w", err)
 	}
-	wc := t.cfg.gcs.Bucket(bucket).Object(obj).NewWriter(ctx)
+	wc := i.gcs.Bucket(bucket).Object(obj).NewWriter(ctx)
 
 	// We are attempting to avoid 429s from GCS, remove this line if it doesn't help.
 	wc.ChunkSize = 0
@@ -1482,4 +1512,38 @@ func (t *task) sourceDir() (string, error) {
 	}
 
 	return sdir, nil
+}
+
+// wrapper around the writeLimiter so this is accounted for in traces
+func (cfg *global) wait(ctx context.Context) error {
+	ctx, span := otel.Tracer("wolfictl").Start(ctx, "package upload ratelimit")
+	defer span.End()
+
+	return cfg.writeLimiter.Wait(ctx)
+}
+
+type indexTask struct {
+	// arch -> files
+	files map[string][]string
+}
+
+type indexer struct {
+	batch        *batch.Work[*indexTask]
+	writeLimiter *rate.Limiter
+	gcs          *storage.Client
+	dstBucket    string
+	signingKey   string
+	outDir       string
+}
+
+func (i *indexer) updateIndex(ctx context.Context, task *indexTask) error {
+	return i.batch.Do(ctx, task)
+}
+
+// wrapper around the writeLimiter so this is accounted for in traces
+func (i *indexer) wait(ctx context.Context) error {
+	ctx, span := otel.Tracer("wolfictl").Start(ctx, "index upload ratelimit")
+	defer span.End()
+
+	return i.writeLimiter.Wait(ctx)
 }
