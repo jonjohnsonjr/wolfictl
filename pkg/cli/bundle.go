@@ -576,6 +576,7 @@ func envFile(arch string) string {
 
 // this is faster than calling task.gitSDE() for every task
 func getEpochs(ctx context.Context, tasks []*task) (map[string]time.Time, error) {
+	log := clog.FromContext(ctx)
 	times := make(map[string]time.Time, len(tasks))
 
 	// Set of files we care about.
@@ -619,6 +620,7 @@ func getEpochs(ctx context.Context, tasks []*task) (map[string]time.Time, error)
 	for scanner.Scan() {
 		// Accumulate lines in group until we hit an empty line.
 		line := scanner.Text()
+		log.Infof("line: %q", line)
 		if line != "" {
 			group = append(group, line)
 			continue
