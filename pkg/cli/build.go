@@ -47,7 +47,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/informers"
+	informerscorev1 "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -649,6 +653,7 @@ type Global struct {
 	StagingBucket string
 
 	clientset *kubernetes.Clientset
+	informer  informerscorev1.PodInformer
 
 	K8sNamespace   string
 	ServiceAccount string
@@ -892,21 +897,25 @@ func (t *task) buildBundleArch(ctx context.Context, arch string) (*bundleResult,
 	if t.cfg.Dedupe {
 		// See if there is already a pod scheduled for this package.
 		goarch := types.ParseArchitecture(arch).String()
-		selectors := []string{
-			fmt.Sprintf("melange.chainguard.dev/package=%s", t.pkg),
-			fmt.Sprintf("melange.chainguard.dev/arch=%s", goarch),
-			fmt.Sprintf("melange.chainguard.dev/version=%s-r%d", t.ver, t.epoch),
+		selector := labels.NewSelector()
+		for k, v := range map[string]string{
+			"melange.chainguard.dev/package": t.pkg,
+			"melange.chainguard.dev/arch":    goarch,
+			"melange.chainguard.dev/version": fmt.Sprintf("%s-r%d", t.ver, t.epoch),
+		} {
+			req, err := labels.NewRequirement(k, selection.Equals, []string{v})
+			if err != nil {
+				return nil, fmt.Errorf("creating requirement %s=%s: %w", k, v, err)
+			}
+			selector = selector.Add(*req)
 		}
 
-		pods, err := t.cfg.clientset.CoreV1().Pods(t.cfg.K8sNamespace).List(ctx, metav1.ListOptions{
-			LabelSelector: strings.Join(selectors, ","),
-		})
+		pods, err := t.cfg.informer.Lister().Pods(t.cfg.K8sNamespace).List(selector)
 		if err != nil {
 			return nil, fmt.Errorf("listing pods: %w", err)
 		}
 
-		for i := range pods.Items {
-			p := &pods.Items[i]
+		for _, p := range pods {
 			if p.Status.Phase == corev1.PodFailed {
 				continue
 			}
@@ -959,7 +968,8 @@ func (t *task) buildBundleArch(ctx context.Context, arch string) (*bundleResult,
 	defer cancel()
 	if err := wait.PollUntilContextCancel(dctx, 5*time.Second, true, wait.ConditionWithContextFunc(func(ctx context.Context) (bool, error) {
 		var err error
-		pod, err = t.cfg.clientset.CoreV1().Pods(t.cfg.K8sNamespace).Get(ctx, pod.ObjectMeta.Name, metav1.GetOptions{})
+
+		pod, err = t.cfg.informer.Lister().Pods(t.cfg.K8sNamespace).Get(pod.ObjectMeta.Name)
 		if err != nil {
 			return false, err
 		}
@@ -1558,7 +1568,13 @@ func (g *Global) initK8s(ctx context.Context) error {
 		}
 	}
 
-	g.clientset = clientset
+	// TODO: This feels NOT RIGHT.
+	factory := informers.NewSharedInformerFactory(clientset, 0)
+	g.informer = factory.Core().V1().Pods()
+	factory.Start(ctx.Done())
+	factory.WaitForCacheSync(ctx.Done())
+
+	log.Debugf("waiting for cache sync")
 
 	return nil
 }
