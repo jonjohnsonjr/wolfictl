@@ -18,8 +18,8 @@ func cmdText() *cobra.Command {
 	text := &cobra.Command{
 		Use:   "text",
 		Short: "Print a sorted list of downstream dependent packages",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if pipelineDir == "" {
 				pipelineDir = filepath.Join(dir, "pipelines")
@@ -39,7 +39,12 @@ func cmdText() *cobra.Command {
 				return err
 			}
 
-			return text(g, pkgs, arch, textType(t), os.Stdout)
+			arg := ""
+			if len(args) == 1 {
+				arg = args[0]
+			}
+
+			return text(g, pkgs, arch, textType(t), os.Stdout, arg)
 		},
 	}
 	text.Flags().StringVarP(&dir, "dir", "d", ".", "directory to search for melange configs")
@@ -69,10 +74,17 @@ var textTypes = []textType{
 	typePackageNameAndVersion,
 }
 
-func text(g *dag.Graph, pkgs *dag.Packages, arch string, t textType, w io.Writer) error {
+func text(g *dag.Graph, pkgs *dag.Packages, arch string, t textType, w io.Writer, arg string) error {
 	filtered, err := g.Filter(dag.FilterLocal())
 	if err != nil {
 		return err
+	}
+
+	if arg != "" {
+		filtered, err = filtered.Subgraph(arg)
+		if err != nil {
+			return err
+		}
 	}
 
 	all, err := filtered.ReverseSorted()
@@ -89,6 +101,7 @@ func text(g *dag.Graph, pkgs *dag.Packages, arch string, t textType, w io.Writer
 	if err != nil {
 		return err
 	}
+
 	want := make(map[string]struct{}, len(mains))
 	for _, main := range mains {
 		name := main.Name()

@@ -1081,3 +1081,80 @@ func cycleError(g graph.Graph[string, Package], src, target string) error {
 
 	return fmt.Errorf("cycle detected: %s -> %s, caused by: %s", src, target, strings.Join(sp, " -> "))
 }
+
+// Subgraph considers only a single node.
+func (g Graph) Subgraph(key string) (*Graph, error) { //nolint:gocyclo
+	subgraph := &Graph{
+		Graph:    newGraph(),
+		packages: g.packages,
+		opts:     g.opts,
+		byName:   map[string][]string{},
+	}
+
+	var byName []Package
+	config := g.packages.PkgConfig(key)
+	if config != nil {
+		byName = append(byName, config)
+	} else {
+		byName, err := g.NodesByName(key)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(byName) == 0 {
+			return nil, fmt.Errorf("could not find node %q", key)
+		}
+	}
+
+	if len(byName) > 1 {
+		return nil, fmt.Errorf("multiple nodes found for %q: %v", key, byName)
+	}
+
+	amap, err := g.Graph.AdjacencyMap()
+	if err != nil {
+		return nil, err
+	}
+
+	h := PackageHash(byName[0])
+
+	// todo: size
+	seen := map[string]struct{}{}
+
+	var walk func(string) error
+	walk = func(k string) error {
+		if _, ok := seen[k]; ok {
+			return nil
+		}
+
+		seen[k] = struct{}{}
+
+		vertex, err := g.Graph.Vertex(k)
+		if err != nil {
+			return err
+		}
+		subgraph.Graph.AddVertex(vertex)
+
+		deps, ok := amap[k]
+		if !ok {
+			return nil
+		}
+
+		for dep, edge := range deps {
+			if err := walk(dep); err != nil {
+				return err
+			}
+
+			if err := subgraph.Graph.AddEdge(edge.Source, edge.Target); err != nil && !errors.Is(err, graph.ErrEdgeAlreadyExists) {
+				return fmt.Errorf("%q (%q) -> %q (%q): %w", edge.Source, dep, edge.Target, k, err)
+			}
+
+		}
+		return nil
+	}
+
+	if err := walk(h); err != nil {
+		return nil, err
+	}
+
+	return subgraph, nil
+}
